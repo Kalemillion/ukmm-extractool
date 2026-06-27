@@ -1,0 +1,15 @@
+[package]
+name = "ukmmsg2json"
+version = "1.0.0"
+edition = "2021"
+description = "Convert UKMM Msg files to readable and editable JSON"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+indexmap = { version = "2", features = ["serde"] }
+msyt = { git = "https://github.com/NiceneNerd/msyt", rev = "12e4d95fb6480f445284f37706db7bfa8351dc06" }
+roead = { version = "1", features = ["with-serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zstd = { version = "0.13", features = ["experimental"] }
