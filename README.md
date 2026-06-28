@@ -2,7 +2,7 @@
 
 **Convert BotW message files from UKMM mods to editable JSON and back.**
 
-Extracts text entries of *Breath of the Wild*, from both UKMM's compressed CBOR message files format (`.sarc`). Edit the JSON, then convert back to a UKMM-ready `.sarc`.
+Extracts text entries of *Breath of the Wild*, from UKMM's compressed CBOR message files format (`.sarc`). Edit the JSON, then convert back to a UKMM-ready `.sarc`.
 
 ---
 
