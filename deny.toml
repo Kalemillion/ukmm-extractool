@@ -1,18 +1,15 @@
-# cargo-deny configuration for ukmmsg2json
-# Run: cargo deny check
-
 [graph]
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 
 [advisories]
-# Report security advisories (RUSTSEC) in dependencies
+
 version = 2
 vulnerability = "deny"
 unmaintained = "warn"
 unsound = "warn"
 yanked = "deny"
 notice = "warn"
-# The msyt git dep won't appear in advisory DB — we track it separately
+
 ignore = []
 
 [licenses]
@@ -26,7 +23,7 @@ allow = [
     "Unicode-3.0",
     "Zlib",
 ]
-# msyt is MIT but from git; we explicitly trust NiceneNerd's repos
+
 private = { ignore = true }
 exceptions = []
 
@@ -34,13 +31,13 @@ exceptions = []
 version = 2
 multiple-versions = "warn"
 wildcards = "deny"
-# Allow git sources only for msyt (trusted upstream)
+
 allow-git = ["https://github.com/NiceneNerd/msyt"]
 
 [sources]
 version = 2
 unknown-registry = "deny"
 unknown-git = "deny"
-# Explicitly trusted sources
+
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = ["https://github.com/NiceneNerd/msyt"]

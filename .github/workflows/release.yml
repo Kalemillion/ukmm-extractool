@@ -1,5 +1,3 @@
-# ukmmsg2json Release — pre-built binaries for end users
-# Triggered by: git tag v1.0.0 && git push --tags
 name: Release
 
 on:
@@ -54,7 +52,6 @@ jobs:
           BINARY="target/${{ matrix.target }}/release/ukmmsg2json"
           chmod +x "$BINARY"
           cp "$BINARY" dist/
-          cp process_msg_mod.ps1 dist/ 2>/dev/null || true
           cp README.md dist/
           cd dist
           tar czf "../ukmmsg2json-${{ matrix.target }}.tar.gz" *
@@ -65,7 +62,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist
           Copy-Item "target/${{ matrix.target }}/release/ukmmsg2json.exe" dist/
-          Copy-Item process_msg_mod.ps1 dist/ -ErrorAction SilentlyContinue
           Copy-Item README.md dist/
           Compress-Archive -Path dist/* -DestinationPath "ukmmsg2json-${{ matrix.target }}.zip"
 
@@ -94,9 +90,8 @@ jobs:
         shell: bash
         run: |
           {
-            echo "## ukmmsg2json ${{ github.ref_name }}"
             echo ""
-            echo "### Downloads"
+            echo ""
             echo ""
             echo "| Platform | Archive |"
             echo "|----------|---------|"
@@ -105,19 +100,11 @@ jobs:
               echo "| \`$name\` | Download below |"
             done
             echo ""
-            echo "### Usage"
             echo ""
-            echo '```bash'
-            echo '# Windows (after extracting)'
-            echo 'ukmmsg2json.exe "Msg_EUfr.product.sarc" -o output.json'
             echo ""
-            echo '# Linux / macOS (after extracting)'
-            echo './ukmmsg2json "Msg_EUfr.product.sarc" -o output.json'
-            echo '```'
+            echo 'Just run the program — it launches in interactive mode and guides you through the process.'
             echo ""
-            echo "### What's included"
-            echo "- \`ukmmsg2json\` — CLI binary (no Rust/CMake/VS needed)"
-            echo "- \`process_msg_mod.ps1\` — PowerShell helper script"
+            echo "- \`ukmmsg2json\` / \`ukmmsg2json.exe\` — portable binary (no dependencies needed)"
             echo "- \`README.md\` — full documentation"
           } > release_body.md
 
