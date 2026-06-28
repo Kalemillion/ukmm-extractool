@@ -14,12 +14,6 @@ Edit the JSON, then convert back to a UKMM-ready `.sarc`.
 Grab the latest binary from the [Releases page](https://github.com/NiceneNerd/ukmmsg2json/releases).
 **No Rust, CMake, or Visual Studio required** — just unzip and run.
 
-| Platform | Archive |
-|----------|---------|
-| Windows | `ukmmsg2json-x86_64-pc-windows-msvc.zip` |
-| Linux   | `ukmmsg2json-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS   | `ukmmsg2json-x86_64-apple-darwin.tar.gz` |
-
 ### 2. Extract texts from a UKMM mod
 
 Run the tool **without arguments** to launch the interactive mod picker:
@@ -43,10 +37,10 @@ Or use the CLI directly for a single file:
 ```json
 {
   "Animal_Cat_A_Name": {
-    "contents": [{ "text": "Mon nouveau texte" }]
+    "contents": [{ "text": "Homestead Munchkin" }]
   },
   "Animal_Cat_A_PictureBook": {
-    "contents": [{ "text": "Nouvelle description..." }]
+    "contents": [{ "text": "This feline creature can be found lazing\nabout in most Hylian settlements. […]" }]
   }
 }
 ```
@@ -57,10 +51,10 @@ After editing the JSON files, run the tool again in interactive mode.
 It detects the existing output and offers the choice:
 
 ```
-Output already exists. [1] Extract again  [2] Rebuild from edited JSONs
+Output already exists. [1] Extract again  [2] Rebuild from edited JSON
 ```
 
-Select **2** to convert all JSONs back to `.sarc` and produce a `_modified.zip`
+Select **2** to convert the JSON back to `.sarc` and produce a `_modified.zip`
 ready for UKMM — just drop it into your mods folder.
 
 Or use the CLI directly:
