@@ -2,90 +2,113 @@
 
 **Convert BotW message files from UKMM mods to editable JSON and back.**
 
-Extracts text entries of *Breath of the Wild*, from UKMM's compressed CBOR message files format (`.sarc`). Edit the JSON, then convert back to a UKMM-ready `.sarc`.
+Extracts text entries of *Breath of the Wild* from UKMM's compressed CBOR message files (`.sarc`).
+Edit the JSON, then convert back to a UKMM-ready `.sarc`.
 
 ---
 
-## Workflow
+## Quick start
 
-### 1. Build
+### 1. Download
 
-```bash
-cargo build --release
-```
+Grab the latest binary from the [Releases page](https://github.com/NiceneNerd/ukmmsg2json/releases).
+**No Rust, CMake, or Visual Studio required** — just unzip and run.
+
+| Platform | Archive |
+|----------|---------|
+| Windows | `ukmmsg2json-x86_64-pc-windows-msvc.zip` |
+| Linux   | `ukmmsg2json-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS   | `ukmmsg2json-x86_64-apple-darwin.tar.gz` |
 
 ### 2. Extract texts from a UKMM mod
 
+Run the tool **without arguments** to launch the interactive mod picker:
+
 ```powershell
-.\process_msg_mod.ps1 -ModsDir "$env:LOCALAPPDATA\ukmm\wiiu\mods" -ModName "MyMod"  # Wii U
-.\process_msg_mod.ps1 -ModsDir "$env:LOCALAPPDATA\ukmm\nx\mods" -ModName "MyMod"    # Switch
+.\ukmmsg2json.exe
 ```
 
-Output: `mods/{wiiu|nx}/MyMod/Msg_{lang}.product.json` + `MyMod_backup.zip`
+It will ask you to pick a platform (Wii U / Switch), scan your UKMM mods folder,
+list all available mods, and let you choose one. The tool then extracts the mod,
+converts all `Msg_*.product.s*rc` files to JSON, and creates a backup ZIP.
+
+Or use the CLI directly for a single file:
+
+```powershell
+.\ukmmsg2json.exe "Msg_EUfr.product.sarc" -o output.json
+```
 
 ### 3. Edit the JSON
 
 ```json
 {
-  "entries": {
-    "Animal_Cat_A_Name": {
-      "contents": [
-        {
-          "text": "Homestead Munchkin"
-        }
-      ]
-    },
-    "Animal_Cat_A_PictureBook": {
-      "contents": [
-        {
-          "text": "This feline creature can be found lazing\nabout in most Hylian settlements. They\nare slow and are often found snacking on\ndiscarded fish. Although they are now\ndomesticated, it is said that in the distant\npast cats were known to be highly\nintelligent and communicate with other\nanimals. Some variants are also friendly\nenough that they don't mind being held."
-        }
-      ]
-    }
+  "Animal_Cat_A_Name": {
+    "contents": [{ "text": "Mon nouveau texte" }]
+  },
+  "Animal_Cat_A_PictureBook": {
+    "contents": [{ "text": "Nouvelle description..." }]
   }
 }
 ```
 
-### 4. Rebuild after editing
+### 4. Rebuild — JSON back to UKMM `.sarc`
 
-```powershell
-.\process_msg_mod.ps1 -ReverseOnly -ModName "MyMod"                 # Wii U
-.\process_msg_mod.ps1 -ReverseOnly -ModName "MyMod" -IncludeSwitch  # Switch
+After editing the JSON files, run the tool again in interactive mode.
+It detects the existing output and offers the choice:
+
+```
+Output already exists. [1] Extract again  [2] Rebuild from edited JSONs
 ```
 
-Output: `mods/{wiiu|nx}/MyMod/MyMod_modified.zip` — ready for UKMM. Just move into `$env:LOCALAPPDATA\ukmm\wiiu\mods` and replace the original (don't worry, you've a backup).
+Select **2** to convert all JSONs back to `.sarc` and produce a `_modified.zip`
+ready for UKMM — just drop it into your mods folder.
+
+Or use the CLI directly:
+
+```powershell
+.\ukmmsg2json.exe "Msg_EUfr.product.json" -r -o "Msg_EUfr.product.sarc"
+```
 
 ---
 
 ## CLI reference
 
 ```
-Usage: ukmmsg2json <INPUT> [OPTIONS]
+Usage: ukmmsg2json [INPUT] [OPTIONS]
 
 Arguments:
-  <INPUT>  Input file (.sarc, .zst, or UKMM CBOR blob)
+  [INPUT]  Input file (.sarc, .zst, .json for reverse).
+           Omit to launch interactive mode.
 
 Options:
   -o, --output <PATH>      Output JSON path (default: stdout)
       --mod-dir <NAME>     Write to mods/{NAME}/
       --auto-dir           Write to mods/<input_filename>/
+  -i, --interactive        Launch interactive mod picker
   -d, --decompress         Force zstd decompression
-  -l, --list-languages     List entry names only
+  -l, --list-languages     List section names only
   -r, --reverse            Convert JSON back to UKMM .sarc (zstd+CBOR)
   -h, --help               Print help
 ```
 
 ---
 
+## Build from source
+
+```bash
+cargo build --release
+```
+
+Requires [Rust](https://rustup.rs/), [CMake](https://cmake.org/), and a C++ compiler (VS Build Tools on Windows).
+
+---
+
 ## How it works
 
 ```
-UKMM mod ZIP → zstd decompress (custom dict) → CBOR → JSON strings → Msyt entries → Output JSON
-
-JSON input → Rebuild Msyt → CBOR (Mergeable::MessagePack) → zstd compress (level 8) → .sarc
+UKMM mod ZIP → zstd (custom dict) → CBOR → JSON strings → Msyt entries → Output JSON
+JSON input → Msyt rebuild → CBOR (Mergeable::MessagePack) → zstd → .sarc
 ```
-
-Key dependencies: `zstd`, `roead`, `msyt`, `clap`, `serde_json`, `indexmap`.
 
 The custom zstd dictionary (`data/zsdic`) is embedded at compile time and sourced from UKMM's `crates/uk-mod/data/zsdic`.
 

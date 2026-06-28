@@ -1,5 +1,4 @@
 //! ukmmsg2json — convert BotW Msg files from UKMM mods to JSON
-//! 
 //!
 //! UKMM stores mod text files as zstd(CBOR(ResourceData::Mergeable(MessagePack))).
 //! The CBOR contains JSON-serialized Msyt objects (entries with text).
@@ -12,11 +11,13 @@
 //!   ukmmsg2json input --mod-dir mod_name          # write to mods/mod_name/
 //!   ukmmsg2json input --auto-dir                  # write to mods/<input_filename>/
 //!   ukmmsg2json -l input                          # list languages
+//!   ukmmsg2json                                    # interactive mode
 
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
     fs,
+    io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
 };
 use anyhow::{Context, Result};
@@ -30,8 +31,9 @@ static ZSTD_DICTIONARY: &[u8] = include_bytes!("../data/zsdic");
 
 #[derive(Parser)]
 struct Cli {
-    /// Input file (Msg_*.product.sarc, .zst, or UKMM CBOR blob)
-    input: PathBuf,
+    /// Input file (Msg_*.product.sarc, .zst, or UKMM CBOR blob).
+    /// Omit to launch interactive mode.
+    input: Option<PathBuf>,
 
     /// Output JSON path (default: stdout, or auto to mods/ with --mod-dir or --auto-dir)
     #[arg(short = 'o', long)]
@@ -56,6 +58,10 @@ struct Cli {
     /// Convert JSON back to UKMM .sarc (zstd+CBOR) format
     #[arg(short = 'r', long)]
     reverse: bool,
+
+    /// Launch interactive mode (mod picker)
+    #[arg(short = 'i', long)]
+    interactive: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -583,15 +589,22 @@ fn write_output(out: &Output, path: &Path) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // ── Interactive mode ──
+    if cli.interactive || cli.input.is_none() {
+        return run_interactive();
+    }
+
+    let input = cli.input.unwrap();
+
     // ── Reverse mode: JSON → UKMM .sarc ──
     if cli.reverse {
-        let json_text = fs::read_to_string(&cli.input)?;
+        let json_text = fs::read_to_string(&input)?;
         let out: Output = serde_json::from_str(&json_text)
             .context("Failed to parse JSON input. Expected ukmmsg2json output format.")?;
         let sarc = from_json_to_cbor(&out)?;
 
         let output_path = cli.output.unwrap_or_else(|| {
-            let stem = filename_stem(&cli.input);
+            let stem = filename_stem(&input);
             PathBuf::from(format!("{stem}.sarc"))
         });
 
@@ -611,11 +624,11 @@ fn main() -> Result<()> {
         // mods/{mod_name}/{stem}.json
         let safe_name = sanitize_mod_dir(mod_name)?;
         let dir = PathBuf::from("mods").join(&safe_name);
-        let stem = filename_stem(&cli.input);
+        let stem = filename_stem(&input);
         Some(dir.join(format!("{stem}.json")))
     } else if cli.auto_dir {
         // ukmmsg2json/mods/{input_stem}/{input_stem}.json
-        let stem = filename_stem(&cli.input);
+        let stem = filename_stem(&input);
         let dir = PathBuf::from("mods").join(&stem);
         Some(dir.join(format!("{stem}.json")))
     } else {
@@ -623,7 +636,7 @@ fn main() -> Result<()> {
     };
 
     // ── Process input file ──
-    let raw = fs::read(&cli.input)?;
+    let raw = fs::read(&input)?;
     let data = decompress(&raw)?;
 
     let out = if is_sarc(&data) {
@@ -648,6 +661,392 @@ fn main() -> Result<()> {
         None => {
             let json = serde_json::to_string_pretty(&out)?;
             println!("{json}");
+        }
+    }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INTERACTIVE MODE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn prompt(message: &str) -> String {
+    print!("{message}");
+    io::stdout().flush().ok();
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line).ok();
+    line.trim().to_string()
+}
+
+struct ModEntry {
+    display_name: String,
+    path: PathBuf,
+    is_dir: bool,
+}
+
+/// Read the `name` field from a UKMM `meta.yml`.
+fn read_meta_name(meta_path: &Path) -> Option<String> {
+    let content = fs::read_to_string(meta_path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(stripped) = line.strip_prefix("name:") {
+            let name = stripped.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn run_interactive() -> Result<()> {
+    println!();
+    println!("╔══════════════════════════════════════════╗");
+    println!("║    ukmmsg2json — Interactive Mode        ║");
+    println!("╚══════════════════════════════════════════╝");
+    println!();
+
+    // ── 1. Choose platform ──
+    println!("Choose your platform:");
+    println!("  [1] Wii U   (~\\AppData\\Local\\ukmm\\wiiu\\mods)");
+    println!("  [2] Switch  (~\\AppData\\Local\\ukmm\\nx\\mods)");
+    let plat_choice = prompt("Select (1 or 2, default=1): ");
+    let is_switch = plat_choice == "2";
+    let (platform, subpath) = if is_switch {
+        ("nx", r"ukmm\nx\mods")
+    } else {
+        ("wiiu", r"ukmm\wiiu\mods")
+    };
+
+    let appdata = std::env::var("LOCALAPPDATA")
+        .context("LOCALAPPDATA not set — are you on Windows?")?;
+    let mods_dir = PathBuf::from(&appdata).join(subpath);
+
+    if !mods_dir.is_dir() {
+        anyhow::bail!("Directory not found: {}\nMake sure UKMM is installed.", mods_dir.display());
+    }
+
+    // ── 2. Scan mods ──
+    println!("\nScanning {} mods...\n", mods_dir.display());
+
+    let mut mods: Vec<ModEntry> = Vec::new();
+
+    // ZIP files
+    if let Ok(entries) = fs::read_dir(&mods_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "zip") {
+                let display = read_zip_meta_name(&path)
+                    .unwrap_or_else(|| filename_stem(&path));
+                mods.push(ModEntry { display_name: display, path, is_dir: false });
+            }
+        }
+    }
+
+    // Loose directories with meta.yml
+    if let Ok(entries) = fs::read_dir(&mods_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let meta_path = path.join("meta.yml");
+                if meta_path.is_file() {
+                    let display = read_meta_name(&meta_path)
+                        .unwrap_or_else(|| filename_stem(&path));
+                    mods.push(ModEntry { display_name: display, path, is_dir: true });
+                }
+            }
+        }
+    }
+
+    // Sort by name
+    mods.sort_by_key(|a| a.display_name.to_lowercase());
+
+    if mods.is_empty() {
+        anyhow::bail!("No mods found in {}.", mods_dir.display());
+    }
+
+    println!("Found {} mod(s):\n", mods.len());
+    for (i, m) in mods.iter().enumerate() {
+        let kind = if m.is_dir { "Directory" } else { "ZIP" };
+        println!("  [{:2}] {}  ({})", i + 1, m.display_name, kind);
+    }
+
+    // ── 3. Pick a mod ──
+    let selection = prompt(&format!("\nSelect a mod to process (1-{}), or press Enter to cancel: ", mods.len()));
+    if selection.is_empty() {
+        println!("Cancelled.\n");
+        return Ok(());
+    }
+    let index: usize = match selection.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= mods.len() => n - 1,
+        _ => {
+            anyhow::bail!("Invalid selection.");
+        }
+    };
+    let chosen = &mods[index];
+    let mod_name = filename_stem(&chosen.path);
+
+    println!("\n  Selected: {}", chosen.display_name);
+
+    let mod_dir_arg = format!("{}/{}", platform, &mod_name);
+    let mods_out_dir = PathBuf::from("mods").join(&mod_dir_arg);
+
+    // ── 4. Check if a rebuild is possible ──
+    let has_existing = mods_out_dir.join(format!("{mod_name}_backup.zip")).is_file()
+        && mods_out_dir.read_dir()
+            .map(|mut d| d.any(|e| e.as_ref().is_ok_and(|e| e.path().extension().is_some_and(|x| x == "json"))))
+            .unwrap_or(false);
+
+    let action = if has_existing {
+        let a = prompt("Output already exists. [1] Extract again  [2] Rebuild from edited JSONs  (default=1): ");
+        if a.trim() == "2" { "rebuild" } else { "extract" }
+    } else {
+        "extract"
+    };
+
+    if action == "rebuild" {
+        return run_rebuild(&mod_name, &mods_out_dir, &mod_dir_arg);
+    }
+
+    // ── 5. Extract to temp dir ──
+    let temp_base = std::env::temp_dir().join("ukmmsg2json");
+    let extract_dir = temp_base.join(&mod_name);
+    if extract_dir.exists() {
+        fs::remove_dir_all(&extract_dir)?;
+    }
+
+    if chosen.is_dir {
+        println!("  Copying loose mod folder...");
+        copy_dir_all(&chosen.path, &extract_dir)?;
+    } else {
+        println!("  Extracting ZIP...");
+        let zip_file = fs::File::open(&chosen.path)?;
+        let mut archive = zip::ZipArchive::new(zip_file)?;
+        archive.extract(&extract_dir)?;
+    }
+
+    // ── 6. Find and convert Msg SARC files ──
+    println!("\n── Converting Msg SARC files to JSON ──\n");
+
+    let msg_files = find_msg_files(&extract_dir);
+    if msg_files.is_empty() {
+        anyhow::bail!("No Msg_*.product.s*rc files found in the mod.");
+    }
+
+    for msg_file in &msg_files {
+        let sarc_path = msg_file.display().to_string();
+
+        let stem = filename_stem(msg_file);
+        let output_path = mods_out_dir.join(format!("{stem}.json"));
+
+        write_output(
+            &convert_file(&sarc_path)?,
+            &output_path,
+        )?;
+    }
+
+    // ── 7. Create backup ZIP ──
+    fs::create_dir_all(&mods_out_dir)?;
+    let backup_name = format!("{mod_name}_backup.zip");
+    let backup_path = mods_out_dir.join(&backup_name);
+
+    if !chosen.is_dir {
+        fs::copy(&chosen.path, &backup_path)?;
+        println!("  ✓ Backup saved: {}", backup_path.display());
+    } else {
+        create_zip_from_dir(&extract_dir, &backup_path)?;
+    }
+
+    // ── 8. Clean up temp ──
+    fs::remove_dir_all(&extract_dir)?;
+
+    println!("\n── Summary ──");
+    println!("  Platform:     {platform}");
+    println!("  Mod:          {}", chosen.display_name);
+    println!("  JSON files:   {}", msg_files.len());
+    println!("  Output:       {}", mods_out_dir.display());
+    println!("  Backup:       {backup_name}");
+    println!("\nDone!\n");
+
+    Ok(())
+}
+
+/// Reverse mode: convert edited JSONs back to .sarc and produce _modified.zip.
+fn run_rebuild(mod_name: &str, mods_out_dir: &Path, _mod_dir_arg: &str) -> Result<()> {
+    let backup_name = format!("{mod_name}_backup.zip");
+    let backup_path = mods_out_dir.join(&backup_name);
+    let modified_name = format!("{mod_name}_modified.zip");
+    let modified_path = mods_out_dir.join(&modified_name);
+
+    println!("\n── Rebuilding modified ZIP from edited JSONs ──\n");
+
+    let json_files: Vec<PathBuf> = match fs::read_dir(mods_out_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .map(|e| e.path())
+            .collect(),
+        Err(_) => vec![],
+    };
+
+    if json_files.is_empty() {
+        anyhow::bail!("No JSON files found in {}.", mods_out_dir.display());
+    }
+
+    // Step 1: Convert each JSON → .sarc
+    let mut converted: Vec<(String, Vec<u8>)> = Vec::new();
+    for json_path in &json_files {
+        let stem = json_path.file_stem().and_then(OsStr::to_str).unwrap_or("unknown");
+        let sarc_name = format!("{stem}.sarc");
+        println!("  Converting: {} → {sarc_name}", json_path.file_name().unwrap_or_default().to_string_lossy());
+
+        let json_text = fs::read_to_string(json_path)?;
+        let out: Output = serde_json::from_str(&json_text)
+            .with_context(|| format!("Failed to parse {}.", json_path.display()))?;
+        let sarc_bytes = from_json_to_cbor(&out)?;
+        converted.push((sarc_name, sarc_bytes));
+    }
+
+    if converted.is_empty() {
+        anyhow::bail!("No JSON files could be converted.");
+    }
+
+    // Step 2: Build _modified.zip from backup + new .sarc files
+    let backup_file = fs::File::open(&backup_path)?;
+    let mut backup_archive = zip::ZipArchive::new(backup_file)?;
+    let modified_file = fs::File::create(&modified_path)?;
+    let mut modified_zip = zip::ZipWriter::new(modified_file);
+
+    // Collect entries we'll replace
+    let replace_names: Vec<String> = converted.iter()
+        .map(|(name, _)| format!("Message/{name}"))
+        .collect();
+
+    // Copy old entries from backup, skipping replaced ones
+    for i in 0..backup_archive.len() {
+        let mut entry = backup_archive.by_index(i)?;
+        let entry_name = entry.name().to_string();
+        if replace_names.contains(&entry_name) {
+            continue; // will be replaced below
+        }
+        let options = if entry.is_dir() {
+            modified_zip.add_directory::<&str, ()>(&entry_name, Default::default())?;
+            continue;
+        } else {
+            zip::write::FileOptions::<()>::default()
+                .compression_method(entry.compression())
+                .last_modified_time(entry.last_modified().unwrap_or_default())
+        };
+        modified_zip.start_file::<&str, ()>(&entry_name, options)?;
+        io::copy(&mut entry, &mut modified_zip)?;
+    }
+
+    // Add new .sarc files (Stored compression to match UKMM format)
+    for (sarc_name, sarc_bytes) in &converted {
+        let entry_name = format!("Message/{sarc_name}");
+        modified_zip.start_file::<&str, ()>(&entry_name, zip::write::FileOptions::<()>::default()
+            .compression_method(zip::CompressionMethod::Stored))?;
+        modified_zip.write_all(sarc_bytes)?;
+        println!("  Added: {entry_name}");
+    }
+
+    modified_zip.finish()?;
+
+    println!("\n── Summary ──");
+    println!("  Modified ZIP: {}", modified_path.display());
+    println!("  Files converted: {}", converted.len());
+    println!("\nDone!\n");
+
+    Ok(())
+}
+
+/// Extract the mod name from inside a UKMM .zip (meta.yml > filename).
+fn read_zip_meta_name(zip_path: &Path) -> Option<String> {
+    let file = fs::File::open(zip_path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let meta = archive.by_name("meta.yml").ok()?;
+    // Read the first few hundred bytes looking for `name:`
+    let mut content = String::new();
+    io::BufReader::with_capacity(4096, meta).read_to_string(&mut content).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(stripped) = line.strip_prefix("name:") {
+            let name = stripped.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn find_msg_files(dir: &Path) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                results.extend(find_msg_files(&path));
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("Msg_") && name.contains(".product.s") && name.ends_with("rc") {
+                    results.push(path);
+                }
+            }
+        }
+    }
+    results
+}
+
+fn convert_file(path: &str) -> Result<Output> {
+    let raw = fs::read(path)?;
+    let data = decompress(&raw)?;
+    if is_sarc(&data) {
+        parse_sarc(&data)
+    } else if looks_like_cbor(&data) {
+        parse_cbor(&data).or_else(|e| {
+            eprintln!("Warning: CBOR parse failed ({e}), trying SARC...");
+            parse_sarc(&data)
+        })
+    } else {
+        parse_sarc(&data)
+    }
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dest_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_all(&entry.path(), &dest_path)?;
+        } else {
+            fs::copy(entry.path(), &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn create_zip_from_dir(src: &Path, dst: &Path) -> Result<()> {
+    let file = fs::File::create(dst)?;
+    let mut zip = zip::ZipWriter::new(file);
+    add_dir_to_zip(src, src, &mut zip)?;
+    zip.finish()?;
+    Ok(())
+}
+
+fn add_dir_to_zip(base: &Path, dir: &Path, mut zip: &mut zip::ZipWriter<fs::File>) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = path.strip_prefix(base).unwrap();
+        if entry.file_type()?.is_dir() {
+            zip.add_directory::<&str, ()>(&name.to_string_lossy(), Default::default())?;
+            add_dir_to_zip(base, &path, zip)?;
+        } else {
+            zip.start_file::<&str, ()>(&name.to_string_lossy(), Default::default())?;
+            let mut f = fs::File::open(&path)?;
+            io::copy(&mut f, &mut zip)?;
         }
     }
     Ok(())
