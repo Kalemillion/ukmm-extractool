@@ -490,20 +490,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ukmmsg2json"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "clap 4.6.1",
- "indexmap 2.14.0",
- "msyt",
- "roead",
- "serde",
- "serde_json",
- "zstd",
-]
-
-[[package]]
 name = "msyt"
 version = "1.2.1"
 source = "git+https://github.com/NiceneNerd/msyt?rev=12e4d95fb6480f445284f37706db7bfa8351dc06#12e4d95fb6480f445284f37706db7bfa8351dc06"
@@ -805,6 +791,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "ukmmsg2json"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "clap 4.6.1",
+ "indexmap 2.14.0",
+ "msyt",
+ "roead",
+ "serde",
+ "serde_json",
+ "zstd",
 ]
 
 [[package]]

@@ -16,6 +16,7 @@
 #       Finds "Foo" (by name or filename) in the given ModsDir, extracts it,
 #       then processes as in folder mode.
 #
+
 #   4. Reverse-only :  .\process_msg_mod.ps1 -ReverseOnly -ModName "Foo"
 #       Skips extraction/backup. Only rebuilds _modified.zip from existing
 #       JSON files and _backup.zip. Use after editing JSON files.
@@ -26,17 +27,17 @@
 #   mods/{platform}/{ModName}/{ModName}_modified.zip  (reverse-converted SARC files injected)
 
 param(
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory = $false)]
     [string]$Source = "",
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory = $false)]
     [string]$ModName = "",
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory = $false)]
     [string]$ModsDir = "",
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory = $false)]
     [string]$OutputDir = "",
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory = $false)]
     [switch]$IncludeSwitch = $false,
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory = $false)]
     [switch]$ReverseOnly = $false
 )
 
@@ -87,7 +88,8 @@ function Get-ModFriendlyName($path, $isDir) {
             }
         }
         return [System.IO.Path]::GetFileName($path)
-    } else {
+    }
+    else {
         try {
             $zipStream = [System.IO.Compression.ZipFile]::OpenRead($path)
             $metaEntry = $zipStream.GetEntry("meta.yml")
@@ -101,7 +103,8 @@ function Get-ModFriendlyName($path, $isDir) {
                 }
             }
             $zipStream.Dispose()
-        } catch {}
+        }
+        catch {}
         return [System.IO.Path]::GetFileNameWithoutExtension($path)
     }
 }
@@ -124,9 +127,11 @@ if (-not $ukmmsg2json) {
 $mode = ""
 if ($Source -and $ModName) {
     $mode = "folder"
-} elseif ($ModsDir -and $ModName) {
+}
+elseif ($ModsDir -and $ModName) {
     $mode = "quick"
-} else {
+}
+else {
     $mode = "interactive"
 }
 
@@ -173,184 +178,197 @@ if ($ReverseOnly) {
 
     $displayName = $ModName
     # Skips mode detection / extraction — jump directly to shared output logic
-} else {
+}
+else {
 
-if ($mode -eq "folder") {
-    # ── Mode 2: Source folder already exists ──
-    $extractDir = [System.IO.Path]::GetFullPath($Source)
-    $modNameFinal = $ModName
+    if ($mode -eq "folder") {
+        # ── Mode 2: Source folder already exists ──
+        $extractDir = [System.IO.Path]::GetFullPath($Source)
+        $modNameFinal = $ModName
 
-    if (-not (Test-Path $extractDir -PathType Container)) {
-        Write-Error "Source folder not found: $extractDir"
-        exit 1
-    }
-    $originalSourcePath = $extractDir
-    $originalIsDir = $true
-    $displayName = (Split-Path $extractDir -Leaf)
-    # Default to wiiu for folder mode, override with -IncludeSwitch
-    $platformLabel = if ($IncludeSwitch) { "nx" } else { "wiiu" }
-
-} elseif ($mode -eq "quick") {
-    # ── Mode 3: Quick find and extract from ModsDir ──
-    $modsDir = [System.IO.Path]::GetFullPath($ModsDir)
-    if (-not (Test-Path $modsDir -PathType Container)) {
-        Write-Error "Mods directory not found: $modsDir"
-        exit 1
-    }
-
-    # Detect platform from path
-    if ($modsDir -match "ukmm\\nx\\mods") {
-        $platformLabel = "nx"
-    } elseif ($modsDir -match "ukmm\\wiiu\\mods") {
-        $platformLabel = "wiiu"
-    } else {
-        $platformLabel = if ($IncludeSwitch) { "nx" } else { "wiiu" }
-    }
-
-    $modNameFinal = $ModName
-    Write-Host "Searching for '$ModName' in $modsDir ..." -ForegroundColor Cyan
-
-    # Try to find by exact name match in filename/dirname
-    $found = $null
-    $zipCandidates = Get-ChildItem -Path $modsDir -Filter "*.zip" -File | Where-Object { $_.BaseName -like "*$ModName*" }
-    $dirCandidates = Get-ChildItem -Path $modsDir -Directory | Where-Object { $_.Name -like "*$ModName*" }
-
-    if ($zipCandidates) {
-        $found = @{ Path = $zipCandidates[0].FullName; IsDir = $false }
-        Write-Host "  Found zip: $($zipCandidates[0].Name)" -ForegroundColor Green
-    } elseif ($dirCandidates) {
-        $found = @{ Path = $dirCandidates[0].FullName; IsDir = $true }
-        Write-Host "  Found directory: $($dirCandidates[0].Name)" -ForegroundColor Green
-    } else {
-        Write-Error "No mod matching '$ModName' found in $modsDir"
-        exit 1
-    }
-
-    $originalSourcePath = $found.Path
-    $originalIsDir = $found.IsDir
-
-    # Extract to temp dir
-    $extractDir = Join-Path $scriptDir "._extract_temp_$modNameFinal"
-    if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
-
-    if ($found.IsDir) {
-        Write-Host "Copying mod folder..." -ForegroundColor Yellow
-        Copy-Item -Path $found.Path -Destination $extractDir -Recurse -Force
-    } else {
-        Write-Host "Copying and extracting zip..." -ForegroundColor Yellow
-        try {
-            [System.IO.Compression.ZipFile]::ExtractToDirectory($found.Path, $extractDir)
-        } catch {
-            Write-Error "Failed to extract: $_"
+        if (-not (Test-Path $extractDir -PathType Container)) {
+            Write-Error "Source folder not found: $extractDir"
             exit 1
         }
+        $originalSourcePath = $extractDir
+        $originalIsDir = $true
+        $displayName = (Split-Path $extractDir -Leaf)
+        # Default to wiiu for folder mode, override with -IncludeSwitch
+        $platformLabel = if ($IncludeSwitch) { "nx" } else { "wiiu" }
+
     }
-
-    $displayName = Get-ModFriendlyName $found.Path $found.IsDir
-
-} else {
-    # ── Mode 1: Interactive ──
-    # Ask which platform first
-    Write-Host "`nUKMM Message Tool - Interactive Mode" -ForegroundColor Magenta
-    Write-Host "=====================================`n" -ForegroundColor Magenta
-
-    Write-Host "Choose your platform:" -ForegroundColor Cyan
-    Write-Host "  [1] Wii U   (~\AppData\Local\ukmm\wiiu\mods)" -ForegroundColor White
-    Write-Host "  [2] Switch  (~\AppData\Local\ukmm\nx\mods)" -ForegroundColor White
-    Write-Host ""
-    $platChoice = Read-Host "Select (1 or 2, default=1)"
-    if (-not $platChoice) { $platChoice = "1" }
-
-    if ($platChoice -eq "2") {
-        $platformLabel = "nx"
-        $modsDir = Join-Path $env:LOCALAPPDATA "ukmm\nx\mods"
-        Write-Host "`nScanning Switch mods..." -ForegroundColor Cyan
-    } else {
-        $platformLabel = "wiiu"
-        $modsDir = Join-Path $env:LOCALAPPDATA "ukmm\wiiu\mods"
-        Write-Host "`nScanning Wii U mods..." -ForegroundColor Cyan
-    }
-
-    if (-not (Test-Path $modsDir -PathType Container)) {
-        Write-Error "Directory not found: $modsDir"
-        Write-Host "Make sure UKMM is installed and you have mods for this platform." -ForegroundColor Yellow
-        exit 1
-    }
-
-    Write-Host "  $modsDir`n" -ForegroundColor DarkGray
-
-    $zipMods = Get-ChildItem -Path $modsDir -Filter "*.zip" -File | Sort-Object Name
-    $dirMods = Get-ChildItem -Path $modsDir -Directory | Sort-Object Name
-
-    $modList = @()
-    foreach ($zip in $zipMods) {
-        $modList += @{
-            DisplayName = Get-ModFriendlyName $zip.FullName $false
-            Path        = $zip.FullName
-            Type        = "ZIP"
-            IsDir       = $false
+    elseif ($mode -eq "quick") {
+        # ── Mode 3: Quick find and extract from ModsDir ──
+        $modsDir = [System.IO.Path]::GetFullPath($ModsDir)
+        if (-not (Test-Path $modsDir -PathType Container)) {
+            Write-Error "Mods directory not found: $modsDir"
+            exit 1
         }
+
+        # Detect platform from path
+        if ($modsDir -match "ukmm\\nx\\mods") {
+            $platformLabel = "nx"
+        }
+        elseif ($modsDir -match "ukmm\\wiiu\\mods") {
+            $platformLabel = "wiiu"
+        }
+        else {
+            $platformLabel = if ($IncludeSwitch) { "nx" } else { "wiiu" }
+        }
+
+        $modNameFinal = $ModName
+        Write-Host "Searching for '$ModName' in $modsDir ..." -ForegroundColor Cyan
+
+        # Try to find by exact name match in filename/dirname
+        $found = $null
+        $zipCandidates = Get-ChildItem -Path $modsDir -Filter "*.zip" -File | Where-Object { $_.BaseName -like "*$ModName*" }
+        $dirCandidates = Get-ChildItem -Path $modsDir -Directory | Where-Object { $_.Name -like "*$ModName*" }
+
+        if ($zipCandidates) {
+            $found = @{ Path = $zipCandidates[0].FullName; IsDir = $false }
+            Write-Host "  Found zip: $($zipCandidates[0].Name)" -ForegroundColor Green
+        }
+        elseif ($dirCandidates) {
+            $found = @{ Path = $dirCandidates[0].FullName; IsDir = $true }
+            Write-Host "  Found directory: $($dirCandidates[0].Name)" -ForegroundColor Green
+        }
+        else {
+            Write-Error "No mod matching '$ModName' found in $modsDir"
+            exit 1
+        }
+
+        $originalSourcePath = $found.Path
+        $originalIsDir = $found.IsDir
+
+        # Extract to temp dir
+        $extractDir = Join-Path $scriptDir "._extract_temp_$modNameFinal"
+        if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+
+        if ($found.IsDir) {
+            Write-Host "Copying mod folder..." -ForegroundColor Yellow
+            Copy-Item -Path $found.Path -Destination $extractDir -Recurse -Force
+        }
+        else {
+            Write-Host "Copying and extracting zip..." -ForegroundColor Yellow
+            try {
+                [System.IO.Compression.ZipFile]::ExtractToDirectory($found.Path, $extractDir)
+            }
+            catch {
+                Write-Error "Failed to extract: $_"
+                exit 1
+            }
+        }
+
+        $displayName = Get-ModFriendlyName $found.Path $found.IsDir
+
     }
-    foreach ($dir in $dirMods) {
-        $metaPath = Join-Path $dir.FullName "meta.yml"
-        if (Test-Path $metaPath -PathType Leaf) {
+    else {
+        # ── Mode 1: Interactive ──
+        # Ask which platform first
+        Write-Host "`nUKMM Message Tool - Interactive Mode" -ForegroundColor Magenta
+        Write-Host "=====================================`n" -ForegroundColor Magenta
+
+        Write-Host "Choose your platform:" -ForegroundColor Cyan
+        Write-Host "  [1] Wii U   (~\AppData\Local\ukmm\wiiu\mods)" -ForegroundColor White
+        Write-Host "  [2] Switch  (~\AppData\Local\ukmm\nx\mods)" -ForegroundColor White
+        Write-Host ""
+        $platChoice = Read-Host "Select (1 or 2, default=1)"
+        if (-not $platChoice) { $platChoice = "1" }
+
+        if ($platChoice -eq "2") {
+            $platformLabel = "nx"
+            $modsDir = Join-Path $env:LOCALAPPDATA "ukmm\nx\mods"
+            Write-Host "`nScanning Switch mods..." -ForegroundColor Cyan
+        }
+        else {
+            $platformLabel = "wiiu"
+            $modsDir = Join-Path $env:LOCALAPPDATA "ukmm\wiiu\mods"
+            Write-Host "`nScanning Wii U mods..." -ForegroundColor Cyan
+        }
+
+        if (-not (Test-Path $modsDir -PathType Container)) {
+            Write-Error "Directory not found: $modsDir"
+            Write-Host "Make sure UKMM is installed and you have mods for this platform." -ForegroundColor Yellow
+            exit 1
+        }
+
+        Write-Host "  $modsDir`n" -ForegroundColor DarkGray
+
+        $zipMods = Get-ChildItem -Path $modsDir -Filter "*.zip" -File | Sort-Object Name
+        $dirMods = Get-ChildItem -Path $modsDir -Directory | Sort-Object Name
+
+        $modList = @()
+        foreach ($zip in $zipMods) {
             $modList += @{
-                DisplayName = Get-ModFriendlyName $dir.FullName $true
-                Path        = $dir.FullName
-                Type        = "Directory (loose)"
-                IsDir       = $true
+                DisplayName = Get-ModFriendlyName $zip.FullName $false
+                Path        = $zip.FullName
+                Type        = "ZIP"
+                IsDir       = $false
+            }
+        }
+        foreach ($dir in $dirMods) {
+            $metaPath = Join-Path $dir.FullName "meta.yml"
+            if (Test-Path $metaPath -PathType Leaf) {
+                $modList += @{
+                    DisplayName = Get-ModFriendlyName $dir.FullName $true
+                    Path        = $dir.FullName
+                    Type        = "Directory (loose)"
+                    IsDir       = $true
+                }
+            }
+        }
+
+        if ($modList.Count -eq 0) {
+            Write-Host "No mods found.`n" -ForegroundColor Yellow
+            exit 0
+        }
+
+        Write-Host "Found $($modList.Count) mod(s):`n" -ForegroundColor Green
+        for ($i = 0; $i -lt $modList.Count; $i++) {
+            Write-Host "  [$($i+1)] $($modList[$i].DisplayName)" -ForegroundColor White
+            Write-Host "       Type: $($modList[$i].Type)" -ForegroundColor DarkGray
+        }
+
+        Write-Host ""
+        $selection = Read-Host "Select a mod to process (1-$($modList.Count)) or press Enter to cancel"
+        if (-not $selection) { Write-Host "Cancelled.`n"; exit 0 }
+
+        $index = if ([int]::TryParse($selection, [ref]0)) { [int]$selection } else { -1 }
+        if ($index -lt 1 -or $index -gt $modList.Count) { Write-Host "Invalid selection.`n"; exit 1 }
+
+        $chosen = $modList[$index - 1]
+        $displayName = $chosen.DisplayName
+
+        $originalSourcePath = $chosen.Path
+        $originalIsDir = $chosen.IsDir
+
+        # Derive mod name from selected mod
+        $modNameFinal = if ($chosen.IsDir) {
+            [System.IO.Path]::GetFileName($chosen.Path)
+        }
+        else {
+            [System.IO.Path]::GetFileNameWithoutExtension($chosen.Path)
+        }
+
+        # Extract to temp dir
+        $extractDir = Join-Path $scriptDir "._extract_temp_$modNameFinal"
+        if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+
+        if ($chosen.IsDir) {
+            Write-Host "Copying loose mod folder..." -ForegroundColor Yellow
+            Copy-Item -Path $chosen.Path -Destination $extractDir -Recurse -Force
+        }
+        else {
+            Write-Host "Extracting zip..." -ForegroundColor Yellow
+            try {
+                [System.IO.Compression.ZipFile]::ExtractToDirectory($chosen.Path, $extractDir)
+            }
+            catch {
+                Write-Error "Failed to extract: $_"
+                exit 1
             }
         }
     }
-
-    if ($modList.Count -eq 0) {
-        Write-Host "No mods found.`n" -ForegroundColor Yellow
-        exit 0
-    }
-
-    Write-Host "Found $($modList.Count) mod(s):`n" -ForegroundColor Green
-    for ($i = 0; $i -lt $modList.Count; $i++) {
-        Write-Host "  [$($i+1)] $($modList[$i].DisplayName)" -ForegroundColor White
-        Write-Host "       Type: $($modList[$i].Type)" -ForegroundColor DarkGray
-    }
-
-    Write-Host ""
-    $selection = Read-Host "Select a mod to process (1-$($modList.Count)) or press Enter to cancel"
-    if (-not $selection) { Write-Host "Cancelled.`n"; exit 0 }
-
-    $index = if ([int]::TryParse($selection, [ref]0)) { [int]$selection } else { -1 }
-    if ($index -lt 1 -or $index -gt $modList.Count) { Write-Host "Invalid selection.`n"; exit 1 }
-
-    $chosen = $modList[$index - 1]
-    $displayName = $chosen.DisplayName
-
-    $originalSourcePath = $chosen.Path
-    $originalIsDir = $chosen.IsDir
-
-    # Derive mod name from selected mod
-    $modNameFinal = if ($chosen.IsDir) {
-        [System.IO.Path]::GetFileName($chosen.Path)
-    } else {
-        [System.IO.Path]::GetFileNameWithoutExtension($chosen.Path)
-    }
-
-    # Extract to temp dir
-    $extractDir = Join-Path $scriptDir "._extract_temp_$modNameFinal"
-    if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
-
-    if ($chosen.IsDir) {
-        Write-Host "Copying loose mod folder..." -ForegroundColor Yellow
-        Copy-Item -Path $chosen.Path -Destination $extractDir -Recurse -Force
-    } else {
-        Write-Host "Extracting zip..." -ForegroundColor Yellow
-        try {
-            [System.IO.Compression.ZipFile]::ExtractToDirectory($chosen.Path, $extractDir)
-        } catch {
-            Write-Error "Failed to extract: $_"
-            exit 1
-        }
-    }
-}
 } # end of else (not ReverseOnly)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -372,9 +390,9 @@ if (-not $ReverseOnly) {
     Write-Host "  Temp:   $extractDir" -ForegroundColor DarkGray
     Write-Host "  Output: $modsOutDir" -ForegroundColor Gray
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  3. FIND AND CONVERT Msg SARC FILES
-# ═══════════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════════════
+    #  3. FIND AND CONVERT Msg SARC FILES
+    # ═══════════════════════════════════════════════════════════════════════════════
 
     Write-Host "`n-- Converting Msg SARC files to JSON ------------------------------" -ForegroundColor Cyan
 
@@ -396,9 +414,9 @@ if (-not $ReverseOnly) {
 
     Write-Host "  -> $jsonCount files extracted to mods/$platformLabel/$modNameSafe/" -ForegroundColor Green
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  4. CREATE BACKUP ZIP
-# ═══════════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════════════
+    #  4. CREATE BACKUP ZIP
+    # ═══════════════════════════════════════════════════════════════════════════════
 
     Write-Host "`n-- Creating backup zip ---------------------------------------------" -ForegroundColor Cyan
 
@@ -410,7 +428,8 @@ if (-not $ReverseOnly) {
         # Original was a .zip — copy it byte-for-byte (UKMM uses Stored compression)
         Copy-Item -Path $originalSourcePath -Destination $backupPath -Force
         Write-Host "  Copied original ZIP (byte-for-byte)" -ForegroundColor Green
-    } else {
+    }
+    else {
         # Source was a directory — re-zip with NoCompression to match UKMM format
         New-ZipFromDirectory $extractDir $backupPath
     }
@@ -441,7 +460,8 @@ if ($ReverseOnly) {
         & $ukmmsg2json $jsonFile.FullName -r -o $sarcTempPath 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0 -and (Test-Path $sarcTempPath)) {
             $convertedSarcs[$sarcName] = $sarcTempPath
-        } else {
+        }
+        else {
             Write-Warning "    Failed to convert $($jsonFile.Name)"
         }
     }
@@ -464,7 +484,8 @@ if ($ReverseOnly) {
                 Write-Host "  Replaced: $entryName" -ForegroundColor Yellow
             }
             Write-Host "  Modified ZIP: $modifiedName" -ForegroundColor Green
-        } finally {
+        }
+        finally {
             $modifiedZip.Dispose()
         }
 

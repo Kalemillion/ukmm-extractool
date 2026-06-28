@@ -73,6 +73,7 @@ fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>> {
             .unwrap_or(data.len().saturating_mul(1024));
         if let Ok(out) = d.decompress(data, size) { return Ok(out); }
     }
+    eprintln!("Warning: custom dictionary decompression failed, falling back to dictionary-less zstd");
     zstd::decode_all(data).context("zstd decompress failed")
 }
 
@@ -136,6 +137,49 @@ fn cbor_write_map_header(buf: &mut Vec<u8>, len: usize) {
 /// The raw map we built before lacked the two enum wrappers, causing UKMM to fail
 /// with "unknown variant, expected Binary, Mergeable, or Sarc".
 fn from_json_to_cbor(out: &Output) -> Result<Vec<u8>> {
+    // ── A08: Validate Output structure before serializing to CBOR ──
+    if out.language.is_empty() {
+        anyhow::bail!("Output language field is empty — refusing to produce CBOR");
+    }
+    if out.language.len() > 64 {
+        anyhow::bail!(
+            "Output language field is suspiciously long ({} chars) — refusing to produce CBOR",
+            out.language.len()
+        );
+    }
+    if out.entries.is_empty() {
+        anyhow::bail!("Output has no entries — refusing to produce empty CBOR");
+    }
+    if out.entry_count != out.entries.len() {
+        anyhow::bail!(
+            "Output entry_count ({}) does not match entries map length ({}) — data may be corrupted",
+            out.entry_count,
+            out.entries.len()
+        );
+    }
+    // Reject section names that attempt path traversal or contain control characters
+    for section_name in out.entries.keys() {
+        if section_name.is_empty() {
+            anyhow::bail!("Output contains an empty section name — refusing to produce CBOR");
+        }
+        if section_name.len() > 512 {
+            anyhow::bail!(
+                "Section name '{section_name}' is too long ({} chars) — refusing to produce CBOR",
+                section_name.len()
+            );
+        }
+        if section_name.contains("..") {
+            anyhow::bail!(
+                "Section name '{section_name}' contains '..' (path traversal) — refusing to produce CBOR"
+            );
+        }
+        if section_name.chars().any(|c| c.is_control()) {
+            anyhow::bail!(
+                "Section name '{section_name:?}' contains control characters — refusing to produce CBOR"
+            );
+        }
+    }
+
     // Build inner MessagePack entries: section_name → JSON string of Msyt entries
     // UKMM expects the full Msyt JSON format:
     //   {"msbt":{"group_count":N,...},"entries":{"Key":{"contents":[...]},...}}
@@ -200,6 +244,26 @@ fn filename_stem(path: &Path) -> String {
         .to_string()
 }
 
+/// Reject mod-dir names that attempt path traversal (e.g. `..`, `../etc`, `foo/../../bar`).
+fn sanitize_mod_dir(name: &str) -> Result<String> {
+    // Reject empty and absolute paths
+    if name.is_empty() {
+        anyhow::bail!("--mod-dir must not be empty");
+    }
+    if name.starts_with('/') || name.starts_with('\\') {
+        anyhow::bail!("--mod-dir must be a relative name, not an absolute path");
+    }
+    // Reject any path component that is exactly ".."
+    for component in name.split(['/', '\\']) {
+        if component == ".." {
+            anyhow::bail!(
+                "--mod-dir must not contain '..' (path traversal rejected): {name:?}"
+            );
+        }
+    }
+    Ok(name.to_string())
+}
+
 /// Parse from a raw SARC archive (game dump style)
 fn parse_sarc(data: &[u8]) -> Result<Output> {
     let mut lang = "unknown".to_string();
@@ -223,41 +287,108 @@ fn parse_sarc(data: &[u8]) -> Result<Output> {
 
 /// Simple CBOR parser: extract all text strings (major type 3) and
 /// byte strings (major type 2) encoded as UTF-8 from a CBOR blob.
+///
+/// This is a best-effort extractor — it is NOT a full CBOR validator.
+/// It skips non-string data items and does not validate map/array nesting.
+///
+/// Safety limits:
+///   - Maximum string length: 100 MiB (guard against malformed length headers)
+///   - Warns on reserved AI values (28-30) and indefinite-length items (31)
+///   - Warns if a u64 length exceeds `usize::MAX` on 32-bit targets
 fn extract_cbor_strings(data: &[u8]) -> Vec<String> {
+    /// Maximum reasonable string length to extract (100 MiB).
+    /// Strings larger than this are almost certainly malformed headers.
+    const MAX_STRING_LEN: usize = 100 * 1024 * 1024;
+
     let mut strings = Vec::new();
     let mut i = 0;
     while i < data.len() {
         let b = data[i];
         let mt = (b >> 5) & 0x07;
         let ai = (b & 0x1f) as usize;
+
         match mt {
+            // Major type 2: byte string — may be UTF-8 text
+            // Major type 3: text string — guaranteed UTF-8
             2 | 3 => {
                 let (sl, adv) = match ai {
                     0..=23 => (ai, 1),
-                    24 if i+1 < data.len() => (data[i+1] as usize, 2),
-                    25 if i+2 < data.len() => {
-                        (u16::from_be_bytes([data[i+1], data[i+2]]) as usize, 3)
+                    24 if i + 1 < data.len() => (data[i + 1] as usize, 2),
+                    25 if i + 2 < data.len() => {
+                        (u16::from_be_bytes([data[i + 1], data[i + 2]]) as usize, 3)
                     }
-                    26 if i+4 < data.len() => {
-                        (u32::from_be_bytes([data[i+1], data[i+2], data[i+3], data[i+4]]) as usize, 5)
-                    }
-                    27 if i+8 < data.len() => {
-                        let n = u64::from_be_bytes([
-                            data[i+1], data[i+2], data[i+3], data[i+4],
-                            data[i+5], data[i+6], data[i+7], data[i+8],
+                    26 if i + 4 < data.len() => {
+                        let n = u32::from_be_bytes([
+                            data[i + 1], data[i + 2], data[i + 3], data[i + 4],
                         ]);
-                        (n as usize, 9)  // truncate; usize < u64 on 32-bit but strings this large are infeasible
+                        (n as usize, 5)
                     }
-                    _ => { i += 1; continue; }
+                    27 if i + 8 < data.len() => {
+                        let n = u64::from_be_bytes([
+                            data[i + 1], data[i + 2], data[i + 3], data[i + 4],
+                            data[i + 5], data[i + 6], data[i + 7], data[i + 8],
+                        ]);
+                        // Warn if u64 length won't fit in usize (32-bit targets)
+                        #[cfg(target_pointer_width = "32")]
+                        if n > usize::MAX as u64 {
+                            eprintln!(
+                                "Warning: CBOR string length {n} exceeds addressable memory; skipping"
+                            );
+                            i += 9;
+                            continue;
+                        }
+                        (n as usize, 9)
+                    }
+                    // AI 28-30: reserved in RFC 7049, treat as parse error
+                    28..=30 => {
+                        eprintln!(
+                            "Warning: CBOR reserved additional info {ai} for string at offset {i}; skipping byte"
+                        );
+                        i += 1;
+                        continue;
+                    }
+                    // AI 31: indefinite-length string (streaming), not supported
+                    31 => {
+                        eprintln!(
+                            "Warning: CBOR indefinite-length string at offset {i} not supported; skipping"
+                        );
+                        i += 1;
+                        continue;
+                    }
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
                 };
+
+                // Sanity check: reject absurdly large lengths
+                if sl > MAX_STRING_LEN {
+                    eprintln!(
+                        "Warning: CBOR string length {sl} exceeds safety limit of {MAX_STRING_LEN} bytes; skipping"
+                    );
+                    i += adv;
+                    continue;
+                }
+
                 let str_start = i + adv;
-                if str_start + sl <= data.len() {
-                    if let Ok(s) = std::str::from_utf8(&data[str_start..str_start+sl]) {
-                        if !s.is_empty() { strings.push(s.to_string()); }
+                let str_end = str_start.saturating_add(sl);
+
+                // Bounds check: the full string must fit within the input buffer
+                if str_end <= data.len() {
+                    if let Ok(s) = std::str::from_utf8(&data[str_start..str_end]) {
+                        if !s.is_empty() {
+                            strings.push(s.to_string());
+                        }
                     }
                 }
-                i = str_start + sl;
+                // If the declared length exceeds available data, skip forward
+                // to avoid getting stuck; advance past the header only.
+                i = str_end.min(data.len());
+                continue;
             }
+
+            // Major type 4: array — skip header + contents fall through
+            // Major type 5: map — skip header (contents handled by loop)
             4 | 5 => {
                 let extra = match ai {
                     0..=23 => 0,
@@ -265,13 +396,71 @@ fn extract_cbor_strings(data: &[u8]) -> Vec<String> {
                     25 => 2,
                     26 => 4,
                     27 => 8,
-                    _ => { i += 1; continue; }
+                    // Reserved or indefinite-length containers
+                    28..=31 => {
+                        eprintln!(
+                            "Warning: CBOR unsupported container AI {ai} at offset {i}; skipping"
+                        );
+                        i += 1;
+                        continue;
+                    }
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
                 };
                 i += 1 + extra;
+                continue;
             }
+
+            // Major type 6: semantic tag — skip the tag number, content follows
+            6 => {
+                let extra = match ai {
+                    0..=23 => 0,
+                    24 => 1,
+                    25 => 2,
+                    26 => 4,
+                    27 => 8,
+                    _ => 0,
+                };
+                i += 1 + extra;
+                continue;
+            }
+
+            // Major type 7: simple values / floats — skip the value bytes
+            7 => {
+                let extra = match ai {
+                    0..=23 => 0,           // simple value (false, true, null, etc.)
+                    24 => 1,               // 1-byte simple
+                    25 => 2,               // IEEE 754 half-precision (2 bytes)
+                    26 => 4,               // IEEE 754 single-precision (4 bytes)
+                    27 => 8,               // IEEE 754 double-precision (8 bytes)
+                    // 28-30: reserved, 31: break code
+                    28..=31 => 0,
+                    _ => 0,
+                };
+                i += 1 + extra;
+                continue;
+            }
+
+            // Major types 0 (uint) and 1 (nint): variable-length integers
+            0 | 1 => {
+                let extra = match ai {
+                    0..=23 => 0,
+                    24 => 1,
+                    25 => 2,
+                    26 => 4,
+                    27 => 8,
+                    _ => 0,
+                };
+                i += 1 + extra;
+                continue;
+            }
+
+            // Unknown major type (should never happen with 3-bit mask)
             _ => {
                 i += 1;
-                if (24..=27).contains(&ai) { i += 1 << (ai - 24); }
+                continue;
             }
         }
     }
@@ -320,19 +509,55 @@ fn parse_cbor(data: &[u8]) -> Result<Output> {
         }
     }
 
-    // Parse JSON blobs
+    // Parse JSON blobs (with basic structural validation before deserialization)
     for (i, blob) in json_blobs.iter().enumerate() {
         let name = names.get(i).cloned().unwrap_or_else(|| format!("section_{i}"));
-        match serde_json::from_str::<serde_json::Value>(blob) {
-            Ok(val) => {
-                if let Some(entries_val) = val.get("entries") {
-                    match serde_json::from_value::<IndexMap<String, Entry>>(entries_val.clone()) {
-                        Ok(im) => { entries.insert(name, im); }
-                        Err(e) => { eprintln!("Warning: failed to deserialize entries: {e}"); }
-                    }
+
+        // Validate that the blob looks like a Msyt entry map before deserializing
+        let val: serde_json::Value = match serde_json::from_str(blob) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Warning: skipping invalid JSON at index {i}: {e}");
+                continue;
+            }
+        };
+
+        let Some(entries_val) = val.get("entries") else {
+            eprintln!("Warning: skipping JSON blob at index {i} — missing 'entries' key");
+            continue;
+        };
+
+        if !entries_val.is_object() {
+            eprintln!("Warning: skipping JSON blob at index {i} — 'entries' is not an object");
+            continue;
+        }
+
+        // Structural check: each entry should have a "contents" array
+        let mut has_contents = false;
+        if let Some(obj) = entries_val.as_object() {
+            for (_, entry_val) in obj {
+                if entry_val.get("contents").is_some_and(|c| c.is_array()) {
+                    has_contents = true;
+                    break;
                 }
             }
-            Err(e) => { eprintln!("Warning: failed to parse JSON at index {i}: {e}"); }
+        }
+        if !has_contents {
+            eprintln!(
+                "Warning: JSON blob at index {i} has 'entries' but no entry contains a 'contents' array — may not be valid Msyt data"
+            );
+        }
+
+        match serde_json::from_value::<IndexMap<String, Entry>>(entries_val.clone()) {
+            Ok(im) => {
+                if im.is_empty() {
+                    eprintln!("Warning: section '{name}' has zero entries after deserialization");
+                }
+                entries.insert(name, im);
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to deserialize entries for section '{name}': {e}");
+            }
         }
     }
 
@@ -384,7 +609,8 @@ fn main() -> Result<()> {
     // ── Determine output path ──
     let output_path: Option<PathBuf> = if let Some(mod_name) = &cli.mod_dir {
         // mods/{mod_name}/{stem}.json
-        let dir = PathBuf::from("mods").join(mod_name);
+        let safe_name = sanitize_mod_dir(mod_name)?;
+        let dir = PathBuf::from("mods").join(&safe_name);
         let stem = filename_stem(&cli.input);
         Some(dir.join(format!("{stem}.json")))
     } else if cli.auto_dir {
@@ -717,5 +943,30 @@ mod tests {
         assert!(all_text.contains("Hello"));
         assert!(all_text.contains("group_count"));
         assert!(all_text.contains("entries"));
+    }
+
+    // ── A08: zstd dictionary integrity ──
+
+    #[test]
+    fn test_zstd_dictionary_integrity() {
+        // The zstd dictionary must not be empty or obviously corrupt.
+        // A valid zstd dictionary:
+        //   - Is at least several KiB (UKMM's is ~110 KiB)
+        //   - Starts with the zstd dictionary magic bytes: 0x37 0xA4 0x30 0xEC
+        assert!(
+            ZSTD_DICTIONARY.len() > 1024,
+            "zstd dictionary is too small ({} bytes) — it may be missing or truncated",
+            ZSTD_DICTIONARY.len()
+        );
+        assert!(
+            ZSTD_DICTIONARY.len() < 1024 * 1024,
+            "zstd dictionary is suspiciously large ({} bytes)",
+            ZSTD_DICTIONARY.len()
+        );
+        assert_eq!(
+            &ZSTD_DICTIONARY[0..4],
+            &[0x37, 0xA4, 0x30, 0xEC],
+            "zstd dictionary is missing expected magic bytes — it may be corrupted or not a zstd dictionary"
+        );
     }
 }
