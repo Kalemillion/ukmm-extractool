@@ -79,16 +79,6 @@ Here's what the output looks like:
 }
 ```
 
-| Field | What it is |
-|-------|------------|
-| `entries` | Section name → messages (order is preserved) |
-| `language` | *(optional)* 4-letter language code — `USen`, `EUfr`, `JPja`… |
-| `entry_count` | *(optional)* Number of message entries — validated if present |
-| `format` | *(optional)* `"SARC"` or `"UKMM CBOR"` — just for reference |
-
-By default the generated JSON only contains `entries`. The other fields are
-accepted on rebuild but not required.
-
 Each message entry contains:
 
 | Field | What it is |
