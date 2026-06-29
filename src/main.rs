@@ -799,7 +799,7 @@ fn run_interactive() -> Result<()> {
 
     // ── Mod selection ─────────────────────────────────────────────────────
     let mod_label = if mods.len() == 1 { "mod" } else { "mods" };
-    println!("Found {} {}:\n", mods.len(), mod_label);
+    println!("Found {} {} with text inside:\n", mods.len(), mod_label);
     for (i, m) in mods.iter().enumerate() {
         println!("  [{:2}] {}", i + 1, m.display_name);
     }
@@ -830,14 +830,14 @@ fn run_interactive() -> Result<()> {
             .unwrap_or(false);
 
     let action = if has_existing {
-        let a = prompt("Output already exists. [1] Extract again  [2] Rebuild from edited JSON  (default = 1): ");
-        if a.trim() == "2" { "rebuild" } else { "extract" }
+        let a = prompt("\nA workspace has been found. What to do with it?\n[1] Send .json into UKMM\n[2] Extract again (UKMM > .json)\n\n(default = 1): ");
+        if a.trim() == "1" { "rebuild" } else { "extract" }
     } else {
         "extract"
     };
 
     if action == "rebuild" {
-        return run_rebuild(&mod_name, &mods_out_dir, &mod_dir_arg);
+        return run_rebuild(&mod_name, &mods_out_dir, &mod_dir_arg, &chosen.path, chosen.is_dir);
     }
 
     // ── Extract/copy mod to temp directory ────────────────────────────────
@@ -908,7 +908,7 @@ fn run_interactive() -> Result<()> {
 /// of the backup ZIP. Original `Message/<name>.sarc` entries are replaced;
 /// all other ZIP entries are copied as-is. Converted entries use
 /// `CompressionMethod::Stored` (no additional compression).
-fn run_rebuild(mod_name: &str, mods_out_dir: &Path, _mod_dir_arg: &str) -> Result<()> {
+fn run_rebuild(mod_name: &str, mods_out_dir: &Path, _mod_dir_arg: &str, mod_path: &Path, is_dir: bool) -> Result<()> {
     let backup_name = format!("{mod_name}_backup.zip");
     let backup_path = mods_out_dir.join(&backup_name);
     let modified_name = format!("{mod_name}.zip");
@@ -994,6 +994,40 @@ fn run_rebuild(mod_name: &str, mods_out_dir: &Path, _mod_dir_arg: &str) -> Resul
     println!("\n── Summary ──");
     println!("  Modified ZIP: {}", modified_path.display());
     println!("  Files converted: {}", converted.len());
+
+    // ── Copy modified ZIP back to UKMM mods directory ────────────────────
+    if !is_dir {
+        fs::copy(&modified_path, mod_path)?;
+        println!("  ✓ Copied to UKMM: {}", mod_path.display());
+    } else {
+        // For loose directories, extract the rebuilt ZIP over the original.
+        let temp_extract = mods_out_dir.join("_rebuild_extract");
+        if temp_extract.exists() {
+            fs::remove_dir_all(&temp_extract)?;
+        }
+        fs::create_dir_all(&temp_extract)?;
+        let zip_file = fs::File::open(&modified_path)?;
+        let mut archive = zip::ZipArchive::new(zip_file)?;
+        archive.extract(&temp_extract)?;
+        // Remove old contents and copy new ones.
+        for entry in fs::read_dir(mod_path)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        copy_dir_all(&temp_extract, mod_path)?;
+        fs::remove_dir_all(&temp_extract)?;
+        println!("  ✓ Extracted to UKMM directory: {}", mod_path.display());
+    }
+
+    // ── Remove the intermediate modified .zip from the output directory ──
+    if modified_path.exists() {
+        fs::remove_file(&modified_path)?;
+    }
+
     println!("\nDone!\n");
 
     Ok(())
