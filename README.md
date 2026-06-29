@@ -41,9 +41,11 @@ ukmmsg2json.exe
 
 1. Edit the `.json` file in `mods/<platform>/<mod_name>/` with any text editor
 2. Run the program again, pick the same mod
-3. Choose **[2] Rebuild from edited JSON**
-4. A new `<mod_name>.zip` is created — ready to be moved into
-   `Local/ukmm/<platform>/mods/`
+3. Choose **[1] Send .json into UKMM**
+4. The modified mod is rebuilt and copied straight into UKMM, overwriting the original
+
+Need to start over? Pick **[3] Restore original (from backup)** to put the
+original mod back.
 
 The rebuild keeps every other file in the mod untouched; only the message
 file is replaced.
@@ -56,8 +58,6 @@ Here's what the output looks like:
 
 ```json
 {
-  "language": "EUen",
-  "entry_count": 219,
   "entries": {
     "ActorType/Prey": {
       "Animal_Cat_A_Name": {
@@ -81,10 +81,13 @@ Here's what the output looks like:
 
 | Field | What it is |
 |-------|------------|
-| `language` | 4-letter language code — `USen`, `EUfr`, `JPja`… |
-| `entry_count` | Number of message entries — must match the map size |
 | `entries` | Section name → messages (order is preserved) |
-| `format` | `"SARC"` or `"UKMM CBOR"` — just for reference |
+| `language` | *(optional)* 4-letter language code — `USen`, `EUfr`, `JPja`… |
+| `entry_count` | *(optional)* Number of message entries — validated if present |
+| `format` | *(optional)* `"SARC"` or `"UKMM CBOR"` — just for reference |
+
+By default the generated JSON only contains `entries`. The other fields are
+accepted on rebuild but not required.
 
 Each message entry contains:
 
@@ -97,8 +100,9 @@ Control tags handle formatting inside messages: `SetColour`, `ResetColour`,
 `Pause`, `Icon`, `Variable`, `Choice`, `SingleChoice`, `Sound`, `Animation`,
 `TextSize`, `AutoAdvance`, `Localisation`, `Font`, and `Bin` (unknown codes).
 
-> If `entry_count` doesn't match the real number of entries, the rebuild
-> will refuse to run — it's a safety check against corrupted edits.
+> If `entry_count` is present in the JSON but doesn't match the real number
+> of entries, the rebuild will refuse to run — it's a safety check against
+> corrupted edits.
 
 ---
 
@@ -108,7 +112,7 @@ Only needed if you want the latest unreleased changes or prefer compiling
 yourself.
 
 ```bash
-git clone https://github.com/NiceneNerd/ukmmsg2json.git
+git clone https://github.com/Kalemillion/ukmmsg2json.git
 cd ukmmsg2json
 cargo build --release
 ```

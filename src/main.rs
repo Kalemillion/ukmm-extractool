@@ -41,28 +41,29 @@ static ZSTD_DICTIONARY: &[u8] = include_bytes!("../data/zsdic");
 ///
 /// ```json
 /// {
-///   "language": "EUen",
-///   "entry_count": 2,
 ///   "entries": {
 ///     "Msg_EUen": {
 ///       "Npc_RecipeName": { "attributes": null, "contents": [...] },
 ///       "Npc_ShopItem":   { "attributes": "...", "contents": [...] }
 ///     }
-///   },
-///   "format": "SARC"
+///   }
 /// }
 /// ```
 #[derive(Serialize, Deserialize)]
 struct Output {
-    /// 4-letter language code (e.g. "USen", "EUfr"), extracted from the section filename.
-    language: String,
-    /// Must equal `entries.len()`. Validated by `from_json_to_cbor()`.
-    entry_count: usize,
+    /// 4-letter language code (e.g. "USen", "EUfr"), extracted from filename/section name.
+    /// Optional — can be omitted from JSON; extracted from filename on rebuild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+    /// Must equal `entries.len()`. Validated by `from_json_to_cbor()`. 
+    /// Optional — omitted from JSON; recomputed from `entries` on rebuild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry_count: Option<usize>,
     /// Section name → ordered map of label → Entry. Uses `BTreeMap` for deterministic key
     /// ordering and `IndexMap` to preserve insertion order within each section.
     entries: BTreeMap<String, IndexMap<String, Entry>>,
     /// Source format hint: `"SARC"` or `"UKMM CBOR"`. Omitted from JSON when `None`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     format: Option<String>,
 }
 
@@ -160,31 +161,34 @@ fn cbor_write_map_header(buf: &mut Vec<u8>, len: usize) {
 ///
 /// # Validation (returns an error if any check fails)
 ///
-/// - `language` must not be empty and ≤ 64 chars
+/// - `language` must not be empty and ≤ 64 chars (if present)
 /// - `entries` must not be empty
-/// - `entry_count` must match `entries.len()`
+/// - `entry_count` must match `entries.len()` (if present)
 /// - Each section name: non-empty, ≤ 512 chars, no `..`, no control characters
 fn from_json_to_cbor(out: &Output) -> Result<Vec<u8>> {
     // ── Input validation ──────────────────────────────────────────────────
 
-    if out.language.is_empty() {
-        anyhow::bail!("Output language field is empty — refusing to produce CBOR");
-    }
-    if out.language.len() > 64 {
-        anyhow::bail!(
-            "Output language field is suspiciously long ({} chars) — refusing to produce CBOR",
-            out.language.len()
-        );
+    if let Some(ref lang) = out.language {
+        if lang.is_empty() {
+            anyhow::bail!("Output language field is empty — refusing to produce CBOR");
+        }
+        if lang.len() > 64 {
+            anyhow::bail!(
+                "Output language field is suspiciously long ({} chars) — refusing to produce CBOR",
+                lang.len()
+            );
+        }
     }
     if out.entries.is_empty() {
         anyhow::bail!("Output has no entries — refusing to produce empty CBOR");
     }
-    if out.entry_count != out.entries.len() {
-        anyhow::bail!(
-            "Output entry_count ({}) does not match entries map length ({}) — data may be corrupted",
-            out.entry_count,
-            out.entries.len()
-        );
+    if let Some(ec) = out.entry_count {
+        if ec != out.entries.len() {
+            anyhow::bail!(
+                "Output entry_count ({ec}) does not match entries map length ({}) — data may be corrupted",
+                out.entries.len()
+            );
+        }
     }
 
     // Validate each section name for length and safety.
@@ -297,29 +301,22 @@ fn filename_stem(path: &Path) -> String {
 /// Parse a SARC archive containing `.msbt` message files into an `Output` struct.
 ///
 /// For each `.msbt` file inside the SARC:
-/// 1. Extract the language code from the **second underscore-delimited segment** (first 4 chars)
-///    of the filename (e.g. `Msg_EUen.product` → `"EUen"`)
-/// 2. Parse the MSBT bytes via `Msyt::from_msbt_bytes()`
-/// 3. Insert entries into the output map keyed by the file stem (without `.msbt` extension)
+/// 1. Parse the MSBT bytes via `Msyt::from_msbt_bytes()`
+/// 2. Insert entries into the output map keyed by the file stem (without `.msbt` extension)
+///
+/// The language code is **not** extracted here — it's set by `convert_file()` from the filename.
 fn parse_sarc(data: &[u8]) -> Result<Output> {
-    let mut lang = "unknown".to_string();
     let mut entries: BTreeMap<String, IndexMap<String, Entry>> = BTreeMap::new();
     let sarc = Sarc::new(data)?;
     for f in sarc.files() {
         let n = match f.name { Some(s) => s, None => continue };
         if !n.ends_with(".msbt") { continue; }
         let stem = n.trim_end_matches(".msbt").to_string();
-        // Extract language from second segment: e.g. "Msg_EUen" → "EUen"
-        if lang == "unknown" {
-            if let Some(c) = stem.split('_').nth(1).map(|s| s.chars().take(4).collect::<String>()) {
-                if c.len() == 4 { lang = c; }
-            }
-        }
         let msyt = Msyt::from_msbt_bytes(f.data())?;
         let bt: IndexMap<String, Entry> = msyt.entries.into_iter().collect();
         entries.insert(stem, bt);
     }
-    Ok(Output { language: lang, entry_count: entries.len(), entries, format: Some("SARC".into()) })
+    Ok(Output { language: None, entry_count: None, entries, format: None })
 }
 
 /// Extract all CBOR text strings (major type 3) and byte strings (major type 2)
@@ -528,7 +525,6 @@ fn extract_cbor_strings(data: &[u8]) -> Vec<String> {
 ///    Detection: first string doesn't start with `{`, second does and
 ///    contains `"entries"` and either `"contents"` or `"group_count"`.
 /// 3. For each JSON blob, parse the `"entries"` object into `IndexMap<String, Entry>`.
-/// 4. Extract the language code from section names containing `/`.
 ///
 /// # Fallback
 ///
@@ -539,7 +535,6 @@ fn extract_cbor_strings(data: &[u8]) -> Vec<String> {
 fn parse_cbor(data: &[u8]) -> Result<Output> {
     let strings = extract_cbor_strings(data);
     let mut entries: BTreeMap<String, IndexMap<String, Entry>> = BTreeMap::new();
-    let mut lang = "unknown".to_string();
 
     // ── Pair up non-JSON names with JSON blobs ────────────────────────────
     let mut names: Vec<String> = Vec::new();
@@ -562,21 +557,6 @@ fn parse_cbor(data: &[u8]) -> Result<Output> {
             json_blobs.push(strings[i].clone());
         }
         i += 1;
-    }
-
-    // ── Extract language code from section names ──────────────────────────
-    // Section names look like "Message/Msg_EUen.product" — extract "EUen".
-    for n in &names {
-        if n.contains("/") {
-            let path = n.replace("\\", "/");
-            if let Some(last) = path.split('/').next_back() {
-                if let Some(c) = last.split('_').nth(1).map(|s| s.chars().take(4).collect::<String>()) {
-                    if c.len() == 4 && c.chars().all(|ch| ch.is_alphanumeric()) {
-                        lang = c;
-                    }
-                }
-            }
-        }
     }
 
     // ── Deserialize each JSON blob into the entries map ───────────────────
@@ -637,7 +617,7 @@ fn parse_cbor(data: &[u8]) -> Result<Output> {
         entries.insert("section_0".to_string(), bt);
     }
 
-    Ok(Output { language: lang, entry_count: entries.len(), entries, format: Some("UKMM CBOR".into()) })
+    Ok(Output { language: None, entry_count: None, entries, format: None })
 }
 
 /// Serialize an `Output` struct to pretty-printed JSON and write to a file.
@@ -650,12 +630,14 @@ fn write_output(out: &Output, path: &Path) -> Result<()> {
     }
     let json = serde_json::to_string_pretty(out)?;
     fs::write(path, &json)?;
-    eprintln!("  ✓ Wrote {} entries to {}", out.entry_count, path.display());
+    eprintln!("  ✓ Wrote {} entries to {}", out.entries.len(), path.display());
     Ok(())
 }
 
 fn main() -> Result<()> {
-    run_interactive()
+    let result = run_interactive();
+    prompt("\nPress Enter to exit... ");
+    result
 }
 
 /// Print a prompt to stdout, flush, and read a single line from stdin.
@@ -830,14 +812,22 @@ fn run_interactive() -> Result<()> {
             .unwrap_or(false);
 
     let action = if has_existing {
-        let a = prompt("\nA workspace has been found. What to do with it?\n[1] Send .json into UKMM\n[2] Extract again (UKMM > .json)\n\n(default = 1): ");
-        if a.trim() == "1" { "rebuild" } else { "extract" }
+        let a = prompt("\nA workspace has been found. What to do with it?\n[1] Send .json into UKMM\n[2] Extract again (UKMM > .json)\n[3] Restore original (from backup)\n\n(default = 1): ");
+        match a.trim() {
+            "2" => "extract",
+            "3" => "restore",
+            _ => "rebuild",
+        }
     } else {
         "extract"
     };
 
     if action == "rebuild" {
         return run_rebuild(&mod_name, &mods_out_dir, &mod_dir_arg, &chosen.path, chosen.is_dir);
+    }
+
+    if action == "restore" {
+        return run_restore(&mod_name, &mods_out_dir, &chosen.path, chosen.is_dir);
     }
 
     // ── Extract/copy mod to temp directory ────────────────────────────────
@@ -1030,6 +1020,49 @@ fn run_rebuild(mod_name: &str, mods_out_dir: &Path, _mod_dir_arg: &str, mod_path
 
     println!("\nDone!\n");
 
+    Ok(())
+}
+
+/// Restore the original backup ZIP back to the UKMM mods directory.
+///
+/// Copies the `_backup.zip` from the workspace back to UKMM (for ZIP mods),
+/// or extracts it over the loose directory (for folder mods).
+fn run_restore(mod_name: &str, mods_out_dir: &Path, mod_path: &Path, is_dir: bool) -> Result<()> {
+    let backup_name = format!("{mod_name}_backup.zip");
+    let backup_path = mods_out_dir.join(&backup_name);
+
+    if !backup_path.exists() {
+        anyhow::bail!("Backup not found: {}", backup_path.display());
+    }
+
+    println!("\n── Restoring original mod from backup ──\n");
+
+    if !is_dir {
+        fs::copy(&backup_path, mod_path)?;
+        println!("  ✓ Restored: {}", mod_path.display());
+    } else {
+        let temp_extract = mods_out_dir.join("_restore_extract");
+        if temp_extract.exists() {
+            fs::remove_dir_all(&temp_extract)?;
+        }
+        fs::create_dir_all(&temp_extract)?;
+        let zip_file = fs::File::open(&backup_path)?;
+        let mut archive = zip::ZipArchive::new(zip_file)?;
+        archive.extract(&temp_extract)?;
+        for entry in fs::read_dir(mod_path)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        copy_dir_all(&temp_extract, mod_path)?;
+        fs::remove_dir_all(&temp_extract)?;
+        println!("  ✓ Restored to UKMM directory: {}", mod_path.display());
+    }
+
+    println!("\nDone!\n");
     Ok(())
 }
 
@@ -1436,8 +1469,8 @@ mod tests {
     #[test]
     fn test_from_json_to_cbor_produces_zstd() {
         let out = Output {
-            language: "EUen".into(),
-            entry_count: 1,
+            language: Some("EUen".into()),
+            entry_count: None,
             entries: BTreeMap::from([
                 ("ActorType/ArmorHead".into(), IndexMap::from([
                     ("Key1".into(), Entry {
