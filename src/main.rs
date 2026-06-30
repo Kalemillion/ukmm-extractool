@@ -274,7 +274,7 @@ fn from_json_to_cbor(out: &Output) -> Result<Vec<u8>> {
 /// 2. If the result starts with `Yaz0`, decompress with yaz0.
 /// 3. Otherwise return the (possibly zstd-decompressed) data as-is.
 ///
-/// This handles the common case where `.product.s*rc` files are:
+/// This handles the common case where `.product.sarc` files are:
 ///   zstd-compressed → Yaz0 archive → SARC or CBOR inside.
 fn decompress(raw: &[u8]) -> Result<Vec<u8>> {
     // Check for zstd magic bytes: 0x28 0xB5 0x2F 0xFD
@@ -776,7 +776,7 @@ fn read_meta_name(meta_path: &Path) -> Option<String> {
 ///    and loose folders (with `meta.yml` + `Msg_*` files)
 /// 3. Present a numbered list, let the user choose
 /// 4. Extract/copy the mod to a temp directory
-/// 5. Convert each `Msg_*.product.s*rc` file to JSON under `mods/<platform>/<mod_name>/`
+/// 5. Convert each `Msg_*.product.sarc` file to JSON under `mods/<platform>/<mod_name>/`
 /// 6. Save the original mod as `<mod_name>_backup.zip`
 /// 7. If output already exists, offer to rebuild instead
 fn run_interactive() -> Result<()> {
@@ -924,7 +924,7 @@ fn run_interactive() -> Result<()> {
 
     let msg_files = find_msg_files(&extract_dir);
     if msg_files.is_empty() {
-        anyhow::bail!("No Msg_*.product.s*rc files found in the mod.");
+        anyhow::bail!("No Msg_*.product.sarc files found in the mod.");
     }
 
     for msg_file in &msg_files {
@@ -1138,7 +1138,7 @@ fn run_restore(mod_name: &str, mods_out_dir: &Path, mod_path: &Path, is_dir: boo
     Ok(())
 }
 
-/// Check whether a ZIP file contains any `Msg_*.product.s*rc` files.
+/// Check whether a ZIP file contains any `Msg_*.product.sarc` files.
 ///
 /// Opens the ZIP and scans entry names without extracting data.
 /// Returns `false` for any I/O error (file not found, corrupt ZIP, etc.).
@@ -1184,7 +1184,7 @@ fn read_zip_meta_name(zip_path: &Path) -> Option<String> {
     None
 }
 
-/// Recursively find all `Msg_*.product.s*rc` files under a directory.
+/// Recursively find all `Msg_*.product.sarc` files under a directory.
 ///
 /// Matches files whose name starts with `Msg_`, contains `.product.s`,
 /// and ends with `rc`. The middle segment is intentionally loose to match
@@ -1986,9 +1986,19 @@ mod tests {
     }
 
     /// Parse a real .bnp file and verify the extracted BnpData structure.
+    ///
+    /// The `.bnp` file is not committed to git, so this test is skipped
+    /// when the file is absent (e.g. in CI runners).
     #[test]
     fn test_parse_bnp_stormbreaker() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/stormbreaker_1b21d.bnp");
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/stormbreaker_1b21d.bnp"
+        ));
+        if !path.exists() {
+            eprintln!("Skipping BNP test — stormbreaker_1b21d.bnp not found");
+            return;
+        }
         let raw = std::fs::read(path).unwrap();
         let bnp = parse_bnp_bytes(&raw).unwrap();
 

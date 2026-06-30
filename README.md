@@ -1,12 +1,15 @@
 # ukmmsg2json
 
-**Convert the `Msg_*.product.sarc` inside a UKMM mod to editable JSON — and back.**
+**Extract Zelda BotW message files from UKMM mods and BCML `.bnp` archives to editable JSON — and back.**
 
 [![MIT Licence](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 
-A CLI companion that extracts the single `Msg_*.product.sarc` from a
-[UKMM](https://github.com/NiceneNerd/ukmm) mod so you can edit the game's
-messages in any text editor, then rebuilds it back into a working UKMM mod.
+A CLI companion that converts game message data from:
+
+| Source | Format | What's inside |
+|--------|--------|---------------|
+| **UKMM** `.zip` | `Msg_*.product.sarc` (SARC archive) |
+| **BCML** `.bnp` | `logs/texts.json` inside a 7z archive |
 
 ---
 
@@ -15,46 +18,50 @@ messages in any text editor, then rebuilds it back into a working UKMM mod.
 Download the latest `ukmmsg2json.exe` (Windows) or `ukmmsg2json` (Linux/MacOS)
 from the [Releases page](https://github.com/Kalemillion/ukmmsg2json/releases).
 
-It's portable! 0 installation needed — just put the binary anywhere and
-double-click it.
+Portable — 0 installation needed, just run the binary.
 
 ---
 
 ## Usage
 
-Run the program — that's it. No prerequite or external dependency.
-
-```
+```bash
 ukmmsg2json.exe
 ```
 
-### What happens
+### UKMM mods — Wii U / Switch
 
-1. You pick a platform — Wii U (1) or Switch (2)
-2. It scans your UKMM mods and lists them
-3. You pick a mod
-4. It extracts the `Msg_*.product.sarc` from the ZIP and converts it to JSON
+1. Pick your platform — **Wii U** (1) or **Switch** (2)
+2. The tool scans your UKMM mods directory (`%LOCALAPPDATA%/ukmm/{wiiu,nx}/mods/`)
+3. Pick a mod from the list
+4. Each `Msg_*.product.sarc` is extracted and converted to JSON
 5. Everything lands in `mods/<platform>/<mod_name>/`
-6. The original mod is backed up as `<mod_name>_backup.zip`
+6. The original mod ZIP is backed up as `<mod_name>_backup.zip`
 
-### Editing & rebuilding
+**Rebuilding:** Run again, pick the same mod, choose **[1] Send .json into UKMM**.
+The modified message file is rebuilt and injected back into the original ZIP.
+All other mod files stay untouched.
 
-1. Edit the `.json` file in `mods/<platform>/<mod_name>/` with any text editor
-2. Run the program again, pick the same mod
-3. Choose **[1] Send .json into UKMM**
-4. The modified mod is rebuilt and copied straight into UKMM, overwriting the original
+**Restore:** Pick **[3] Restore original (from backup)** to undo all edits.
 
-Need to start over? Pick **[3] Restore original (from backup)** to put the
-original mod back.
+### BCML `.bnp` files
 
-The rebuild keeps every other file in the mod untouched; only the message
-file is replaced.
+1. Pick **3 — Load a .bnp file**
+2. Drag & drop or type the path to a `.bnp` file
+3. The tool reads `info.json` (mod name, platform) and `logs/texts.json`
+4. Choose output format:
+   - **[1] Single `texts.json`** — BCML-compatible file with selected languages
+   - **[2] Individual files** — one `Msg_<lang>.product.json` per language
+5. A language picker lets you choose which languages to export (e.g. `1,3,5-7` or `all`)
+6. Everything lands in `mods/<platform>/<mod_name>/`
+7. The original `.bnp` is backed up as `<mod_name>_backup.bnp`
+
+**Rebuilding:** Run again with the same `.bnp`, choose **[1] Send .json into BNP**.
+The tool reconstructs `logs/texts.json` from your edited JSONs and re-packages
+the 7z archive. A warning is shown if the original `.bnp` was moved.
 
 ---
 
 ## JSON format
-
-Here's what the output looks like:
 
 ```json
 {
@@ -79,27 +86,9 @@ Here's what the output looks like:
 }
 ```
 
-Each message entry contains:
-
-| Field | What it is |
-|-------|------------|
-| `attributes` | Optional metadata string from the game (`null` if absent) |
-| `contents` | The actual message — text and control tags mixed together |
-
-Control tags handle formatting inside messages: `SetColour`, `ResetColour`,
-`Pause`, `Icon`, `Variable`, `Choice`, `SingleChoice`, `Sound`, `Animation`,
-`TextSize`, `AutoAdvance`, `Localisation`, `Font`, and `Bin` (unknown codes).
-
-> If `entry_count` is present in the JSON but doesn't match the real number
-> of entries, the rebuild will refuse to run — it's a safety check against
-> corrupted edits.
-
 ---
 
 ## Building from source
-
-Only needed if you want the latest unreleased changes or prefer compiling
-yourself.
 
 ```bash
 git clone https://github.com/Kalemillion/ukmmsg2json.git
@@ -107,15 +96,16 @@ cd ukmmsg2json
 cargo build --release
 ```
 
-The binary appears in `target/release/`.
+Binary at `target/release/ukmmsg2json.exe`.
 
-Development commands:
+### Development
 
 ```bash
-cargo test                  # 26 unit tests
-cargo clippy -- -D warnings # Catch common mistakes
-cargo deny check            # Licence & security audit
-cargo audit                 # Vulnerability scan
+cargo test                     # 27+ unit tests
+cargo clippy -- -D warnings    # Lint (must pass CI)
+cargo fmt -- --check           # Formatting (rustfmt defaults)
+cargo deny check               # Supply-chain audit
+cargo audit                    # Vulnerability scan
 ```
 
 ---
