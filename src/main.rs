@@ -21,6 +21,8 @@ use std::{
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use msyt::{model::Entry, Msyt};
+use sevenz_rust::*;
+use std::io::Cursor;
 use roead::sarc::Sarc;
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +32,18 @@ use serde::{Deserialize, Serialize};
 /// Without it, compression may be less effective or fail for some inputs.
 /// The fallback is dictionary-less zstd (with a warning to stderr).
 static ZSTD_DICTIONARY: &[u8] = include_bytes!("../data/zsdic");
+
+/// First 6 bytes of a 7z / BCML .bnp archive.
+const BNP_MAGIC: &[u8] = &[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c];
+
+/// Section names to automatically strip from extracted message files.
+///
+/// These sections are "contaminated" data from BCML that – most of the time –
+/// shouldn't be included in the output JSON or rebuilt into UKMM.
+const FILTER_SECTIONS: &[&str] = &[
+    "EventFlowMsg/MiniGame_Crosscountry",
+    "EventFlowMsg/MiniGame_HorsebackArchery",
+];
 
 /// Top-level JSON structure produced by the rebuild step.
 ///
@@ -652,6 +666,57 @@ fn prompt(message: &str) -> String {
     line.trim().to_string()
 }
 
+/// Interactive checkbox-style multi-select prompt.
+///
+/// Shows `items` with `[ ]` / `[x]` markers. The user enters a number to
+/// toggle an item and presses Enter (empty input) to confirm.
+/// Returns the list of selected items.
+fn prompt_checkbox_selection(items: &[String], header: &str) -> Vec<String> {
+    let n = items.len();
+
+    println!("\n{header}");
+    for (i, item) in items.iter().enumerate() {
+        println!("  [{:2}]  {item}", i + 1);
+    }
+    println!("  [all]  Select / deselect all");
+
+    let input = prompt("Enter numbers (comma-separated, ranges like 1-5, or 'all'): ");
+    let input = input.trim().to_lowercase();
+
+    if input == "all" {
+        return items.to_vec();
+    }
+
+    let mut selected = vec![false; n];
+
+    // Accept commas, semicolons or spaces as separators.
+    for part in input.split(&[',', ';', ' '][..]) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        if let Some((a, b)) = part.split_once('-') {
+            let lo = a.trim().parse::<usize>().unwrap_or(1).max(1).min(n);
+            let hi = b.trim().parse::<usize>().unwrap_or(n).max(1).min(n);
+            for i in lo..=hi {
+                selected[i - 1] = true;
+            }
+        } else if let Ok(num) = part.parse::<usize>() {
+            if num >= 1 && num <= n {
+                selected[num - 1] = true;
+            }
+        }
+    }
+
+    items
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| selected[*i])
+        .map(|(_, item)| item.clone())
+        .collect()
+}
+
 /// Resolve the UKMM data directory based on platform conventions.
 ///
 /// Resolution order:
@@ -725,11 +790,18 @@ fn run_interactive() -> Result<()> {
     let wiiu_path = ukmm_root.join("wiiu").join("mods");
     let nx_path = ukmm_root.join("nx").join("mods");
 
-    // ── Platform selection ────────────────────────────────────────────────
+    // ── Platform / Source selection ───────────────────────────────────────
     println!("Choose your platform:");
     println!("  [1] Wii U");
     println!("  [2] Switch");
-    let plat_choice = prompt("\nSelect 1 or 2 (default = 1): ");
+    println!("  [3] Load a .bnp file");
+    let plat_choice = prompt("\nSelect 1, 2 or 3 (default = 1): ");
+
+    // Option 3: process a .bnp file with full workspace management.
+    if plat_choice == "3" {
+        return handle_bnp_interactive();
+    }
+
     let is_switch = plat_choice == "2";
     let (platform, mods_dir) = if is_switch {
         ("nx", nx_path)
@@ -1134,14 +1206,123 @@ fn find_msg_files(dir: &Path) -> Vec<PathBuf> {
     results
 }
 
+/// Data extracted from a BCML `.bnp` archive.
+struct BnpData {
+    /// Mod display name (from `info.json`).
+    name: String,
+    /// Target platform: `"wiiu"` or `"nx"`.
+    platform: String,
+    /// One `Output` per language, keyed by language code (e.g. `"USen"`, `"EUfr"`).
+    outputs: BTreeMap<String, Output>,
+}
+
+/// Convert a single BCML language block (section.msyt → entries) into our `Output`.
+fn bcml_lang_to_output(language: String, sections: BTreeMap<String, serde_json::Value>) -> Output {
+    let mut entries: BTreeMap<String, IndexMap<String, Entry>> = BTreeMap::new();
+
+    for (section_name, entry_map) in sections {
+        let clean_name = section_name.strip_suffix(".msyt").unwrap_or(&section_name).to_string();
+
+        if let Some(obj) = entry_map.as_object() {
+            let mut im: IndexMap<String, Entry> = IndexMap::new();
+            for (key, val) in obj {
+                match serde_json::from_value::<Entry>(val.clone()) {
+                    Ok(e) => {
+                        im.insert(key.clone(), e);
+                    }
+                    Err(err) => {
+                        eprintln!("Warning: skipping entry '{key}' in section '{clean_name}': {err}");
+                    }
+                }
+            }
+            if !im.is_empty() {
+                entries.insert(clean_name, im);
+            }
+        }
+    }
+
+    Output {
+        language: Some(language),
+        entry_count: None,
+        entries,
+        format: None,
+    }
+}
+
+/// Parse a BCML `.bnp` archive (a 7z file) into a `BnpData`.
+///
+/// Extracts `info.json` (for name & platform) and `logs/texts.json` (for all
+/// language entries). Each language in the BCML JSON becomes a separate `Output`.
+fn parse_bnp_bytes(data: &[u8]) -> Result<BnpData> {
+    let len = data.len() as u64;
+    let cursor = Cursor::new(data.to_vec());
+    let mut reader =
+        SevenZReader::new(cursor, len, Password::default()).context("Failed to open 7z archive")?;
+
+    let mut info_json: Option<Vec<u8>> = None;
+    let mut texts_json: Option<Vec<u8>> = None;
+
+    reader
+        .for_each_entries(|entry, entry_reader| {
+            let mut buf = Vec::new();
+            let _ = entry_reader.read_to_end(&mut buf);
+            match entry.name() {
+                "info.json" => info_json = Some(buf),
+                "logs/texts.json" => texts_json = Some(buf),
+                _ => {}
+            }
+            Ok(true)
+        })
+        .context("Failed to extract files from BNP archive")?;
+
+    let info: serde_json::Value = serde_json::from_slice(
+        &info_json.ok_or_else(|| anyhow::anyhow!("BNP archive missing info.json"))?,
+    )
+    .context("Failed to parse info.json")?;
+
+    let name = info
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let platform = info
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .unwrap_or("wiiu")
+        .to_string();
+
+    let json_bytes =
+        texts_json.ok_or_else(|| anyhow::anyhow!("BNP archive missing logs/texts.json"))?;
+
+    // BCML format: { lang: { section.msyt: { entries... } } }
+    let bcml: BTreeMap<String, BTreeMap<String, serde_json::Value>> =
+        serde_json::from_slice(&json_bytes).context("Failed to parse BCML texts.json")?;
+
+    let mut outputs: BTreeMap<String, Output> = BTreeMap::new();
+    for (language, sections) in bcml {
+        let mut out = bcml_lang_to_output(language.clone(), sections);
+        // Strip contaminated sections silently (the caller prints one summary line).
+        for section in FILTER_SECTIONS {
+            let _ = out.entries.remove(*section);
+        }
+        outputs.insert(language, out);
+    }
+
+    Ok(BnpData { name, platform, outputs })
+}
+
 /// Read, decompress, and parse a single message file into an `Output` struct.
 ///
 /// This is the same pipeline as `main()` uses for forward conversion,
 /// extracted as a reusable function for the interactive mode.
+///
+/// After parsing, any section whose name appears in [`FILTER_SECTIONS`] is
+/// automatically removed from the output and a warning is printed to stderr.
 fn convert_file(path: &str) -> Result<Output> {
     let raw = fs::read(path)?;
+
     let data = decompress(&raw)?;
-    if is_sarc(&data) {
+    let mut out = if is_sarc(&data) {
         parse_sarc(&data)
     } else if looks_like_cbor(&data) {
         parse_cbor(&data).or_else(|e| {
@@ -1150,7 +1331,295 @@ fn convert_file(path: &str) -> Result<Output> {
         })
     } else {
         parse_sarc(&data)
+    }?;
+
+    // ── Strip contaminated sections ────────────────────────────────────────
+    for section in FILTER_SECTIONS {
+        if out.entries.remove(*section).is_some() {
+            eprintln!("  ✓ Removed contaminated section '{section}'");
+        }
     }
+
+    Ok(out)
+}
+
+/// Full interactive workflow for a .bnp file: extract → backup → rebuild.
+///
+/// 1. Ask for the .bnp path
+/// 2. Parse `info.json` for mod name + platform
+/// 3. Parse all languages from `logs/texts.json`
+/// 4. Write each language as `Msg_<lang>.product.json` under `mods/<platform>/<mod_name>/`
+/// 5. Save a backup of the .bnp
+/// 6. If a workspace already exists, offer rebuild / extract-again / restore
+fn handle_bnp_interactive() -> Result<()> {
+    let bnp_path = prompt("Drag & drop or enter path to .bnp file: ");
+    let bnp_path = bnp_path.trim_matches('"').to_string();
+    let path = Path::new(&bnp_path);
+    if !path.exists() {
+        anyhow::bail!("File not found: {}", path.display());
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext != "bnp" {
+        anyhow::bail!("Expected a .bnp file, got .{ext}");
+    }
+
+    let raw = fs::read(&bnp_path)?;
+    if raw.len() <= BNP_MAGIC.len() || raw[..BNP_MAGIC.len()] != *BNP_MAGIC {
+        anyhow::bail!("File does not appear to be a valid 7z archive (missing 7z magic)");
+    }
+
+    eprintln!("Found a .bnp file. Parsing contents...");
+    let bnp = parse_bnp_bytes(&raw)?;
+
+    println!("  ✓ Removed BCML's entry bugs 'EventFlowMsg/MiniGame_Crosscountry' \
+& 'EventFlowMsg/MiniGame_HorsebackArchery'");
+
+    let mod_name = sanitize_filename(&bnp.name);
+    let platform = &bnp.platform;
+    let mods_out_dir = PathBuf::from("mods").join(platform).join(&mod_name);
+    let backup_name = format!("{mod_name}_backup.bnp");
+    let backup_path = mods_out_dir.join(&backup_name);
+
+    // ── Check for existing workspace ───────────────────────────────────────
+    let workspace_exists = backup_path.is_file()
+        && mods_out_dir.read_dir()
+            .map(|mut d| d.any(|e| e.as_ref().is_ok_and(|e| {
+                e.path().extension().is_some_and(|x| x == "json")
+            })))
+            .unwrap_or(false);
+
+    let action = if workspace_exists {
+        let a = prompt("\nA workspace exists for this mod. What to do with it?\n[1] Send .json into BNP\n[2] Extract again (BNP > .json)\n[3] Restore original (from backup)\n\n(default = 1): ");
+        match a.trim() {
+            "2" => "extract",
+            "3" => "restore",
+            _ => "rebuild",
+        }
+    } else {
+        "extract"
+    };
+
+    if action == "rebuild" {
+        let r = run_bnp_rebuild(&mod_name, &mods_out_dir, &bnp_path, &backup_path, path);
+        open_explorer(&mods_out_dir);
+        return r;
+    }
+
+    if action == "restore" {
+        let r = run_bnp_restore(&backup_path, &bnp_path, path);
+        open_explorer(&mods_out_dir);
+        return r;
+    }
+
+    // ── Ask output format ─────────────────────────────────────────────────
+    println!("\nAvailable languages: {}\n", bnp.outputs.keys().cloned().collect::<Vec<_>>().join(", "));
+    let mode = prompt("Output format:\n[1] Unique texts.json (1 for all lang; bcml-like)\n[2] Multiple language files (1 lang = 1 file)\n\nSelect 1 or 2 (default = 1): ");
+
+    if mode.trim() == "1" {
+        // ── Interactive checkbox selection of languages ──────────────────────
+        let lang_keys: Vec<String> = bnp.outputs.keys().cloned().collect();
+        let selected = prompt_checkbox_selection(
+            &lang_keys,
+            "Select languages (enter number to toggle, Enter to confirm):",
+        );
+        if selected.is_empty() {
+            anyhow::bail!("No languages selected.");
+        }
+
+        // Build BCML-format JSON: { lang: { section.msyt: entries } }
+        let mut bcml: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        for lang in &selected {
+            let out = &bnp.outputs[lang.as_str()];
+            let mut sections: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            for (section_name, entries) in &out.entries {
+                let msyt_name = format!("{section_name}.msyt");
+                sections.insert(msyt_name, serde_json::to_value(entries).unwrap_or_default());
+            }
+            bcml.insert((*lang).clone(), serde_json::Value::Object(
+                sections.into_iter().collect()
+            ));
+        }
+
+        let json_text = serde_json::to_string_pretty(&bcml)?;
+        fs::create_dir_all(&mods_out_dir)?;
+        let output_path = mods_out_dir.join("texts.json");
+        fs::write(&output_path, &json_text)?;
+        eprintln!("  ✓ Wrote {} languages to {}", selected.len(), output_path.display());
+
+        fs::create_dir_all(&mods_out_dir)?;
+        fs::copy(&bnp_path, &backup_path)?;
+        println!("  ✓ Backup saved: {}", backup_path.display());
+
+        println!("\n── Summary ──");
+        println!("  Platform:     {platform}");
+        println!("  Mod:          {}", bnp.name);
+        println!("  Languages:    {}", selected.len());
+        println!("  Output:       {}", output_path.display());
+        println!("  Backup:       {backup_name}");
+        println!();
+        open_explorer(&mods_out_dir);
+        return Ok(());
+    }
+
+    // ── Individual Msg_<lang>.product.json for selected languages ────────
+    let lang_keys: Vec<String> = bnp.outputs.keys().cloned().collect();
+    let selected = prompt_checkbox_selection(
+        &lang_keys,
+        "Select languages to extract (enter number to toggle, Enter to confirm):",
+    );
+    if selected.is_empty() {
+        anyhow::bail!("No languages selected.");
+    }
+
+    println!("\n── Converting BNP to JSON ──\n");
+    fs::create_dir_all(&mods_out_dir)?;
+
+    for lang in &selected {
+        if let Some(out) = bnp.outputs.get(lang) {
+            let stem = format!("Msg_{lang}.product");
+            let output_path = mods_out_dir.join(format!("{stem}.json"));
+            write_output(out, &output_path)?;
+        }
+    }
+
+    // ── Save backup ───────────────────────────────────────────────────────
+    fs::create_dir_all(&mods_out_dir)?;
+    fs::copy(&bnp_path, &backup_path)?;
+    println!("  ✓ Backup saved: {}", backup_path.display());
+
+    // ── Summary ───────────────────────────────────────────────────────────
+    println!("\n── Summary ──");
+    println!("  Platform:     {platform}");
+    println!("  Mod:          {}", bnp.name);
+    println!("  Languages:    {}", selected.len());
+    println!("  Output:       {}", mods_out_dir.display());
+    println!("  Backup:       {backup_name}");
+    println!();
+    open_explorer(&mods_out_dir);
+
+    Ok(())
+}
+
+/// Rebuild a .bnp archive from edited JSON files.
+///
+/// Reads all `Msg_*.product.json` files from the workspace, reconstructs the
+/// BCML `texts.json` format, then extracts the original backup to a temp dir,
+/// replaces `logs/texts.json`, and re-compresses to a new `.bnp`.
+fn run_bnp_rebuild(mod_name: &str, mods_out_dir: &Path, _orig_bnp_path: &str, backup_path: &Path, orig_path: &Path) -> Result<()> {
+    println!("\n── Rebuilding BNP from edited JSONs ──\n");
+
+    // ── Collect JSON files ────────────────────────────────────────────────
+    let json_files: Vec<PathBuf> = match fs::read_dir(mods_out_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .map(|e| e.path())
+            .collect(),
+        Err(_) => vec![],
+    };
+
+    if json_files.is_empty() {
+        anyhow::bail!("No JSON files found in {}.", mods_out_dir.display());
+    }
+
+    // ── Reconstruct BCML texts.json ───────────────────────────────────────
+    let mut bcml: BTreeMap<String, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
+
+    for json_path in &json_files {
+        let stem = json_path.file_stem().and_then(OsStr::to_str).unwrap_or("");
+        // Extract language from "Msg_USen.product" → "USen".
+        let language = stem
+            .strip_prefix("Msg_")
+            .and_then(|s| s.strip_suffix(".product"))
+            .unwrap_or(stem)
+            .to_string();
+
+        let json_text = fs::read_to_string(json_path)?;
+        let out: Output = serde_json::from_str(&json_text)
+            .with_context(|| format!("Failed to parse {}", json_path.display()))?;
+
+        // Re-add .msyt to section names.
+        let mut sections: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        for (section_name, entries) in &out.entries {
+            let msyt_name = format!("{section_name}.msyt");
+            let entries_val = serde_json::to_value(entries)
+                .with_context(|| format!("Failed to serialize entries for {section_name}"))?;
+            sections.insert(msyt_name, entries_val);
+        }
+        bcml.insert(language, sections);
+    }
+
+    let new_texts = serde_json::to_string_pretty(&bcml)?;
+
+    // ── Check if original .bnp has been moved ─────────────────────────────
+    let bnp_moved = !orig_path.exists();
+    let rebuild_path = if bnp_moved {
+        // Place rebuilt .bnp next to the workspace.
+        let fallback = mods_out_dir.join(format!("{mod_name}.bnp"));
+        eprintln!("Warning: original .bnp has been moved — saving rebuilt file to: {}",
+            fallback.display());
+        fallback
+    } else {
+        orig_path.to_path_buf()
+    };
+
+    // ── Extract backup to temp dir, replace texts.json, re-compress ───────
+    let temp_dir = std::env::temp_dir().join("ukmmsg2json_bnp_rebuild");
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir)?;
+    }
+    fs::create_dir_all(&temp_dir)?;
+
+    // Decompress the backup into the temp directory.
+    let bnp_backup_file = fs::File::open(backup_path)?;
+    sevenz_rust::decompress(bnp_backup_file, &temp_dir)
+        .context("Failed to extract backup BNP")?;
+
+    // Write the rebuilt texts.json.
+    let texts_dir = temp_dir.join("logs");
+    fs::create_dir_all(&texts_dir)?;
+    fs::write(texts_dir.join("texts.json"), &new_texts)?;
+
+    // Re-compress the temp directory to a new .bnp.
+    eprintln!("Compressing rebuilt BNP...");
+    sevenz_rust::compress_to_path(&temp_dir, &rebuild_path)
+        .context("Failed to compress rebuilt BNP")?;
+
+    fs::remove_dir_all(&temp_dir)?;
+
+    println!("  ✓ Rebuilt BNP: {}", rebuild_path.display());
+    println!();
+    open_explorer(mods_out_dir);
+
+    Ok(())
+}
+
+/// Restore the original .bnp from backup.
+fn run_bnp_restore(backup_path: &Path, _bnp_path: &str, orig_path: &Path) -> Result<()> {
+    if !backup_path.exists() {
+        anyhow::bail!("Backup not found: {}", backup_path.display());
+    }
+    println!("\n── Restoring original BNP from backup ──\n");
+    fs::copy(backup_path, orig_path)?;
+    println!("  ✓ Restored: {}", orig_path.display());
+    println!();
+    Ok(())
+}
+
+/// Sanitize a string for use as a directory name (replace path-unfriendly chars).
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Open Windows Explorer at the given directory.
+fn open_explorer(path: &Path) {
+    let _ = std::process::Command::new("explorer")
+        .arg(path)
+        .spawn();
 }
 
 /// Recursively copy a directory tree.
@@ -1514,5 +1983,46 @@ mod tests {
             &[0x37, 0xA4, 0x30, 0xEC],
             "zstd dictionary is missing expected magic bytes — it may be corrupted or not a zstd dictionary"
         );
+    }
+
+    /// Parse a real .bnp file and verify the extracted BnpData structure.
+    #[test]
+    fn test_parse_bnp_stormbreaker() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/stormbreaker_1b21d.bnp");
+        let raw = std::fs::read(path).unwrap();
+        let bnp = parse_bnp_bytes(&raw).unwrap();
+
+        // Should have detected platform and name from info.json.
+        assert_eq!(bnp.platform, "wiiu");
+        assert_eq!(bnp.name, "Stormbreaker");
+
+        // Should have extracted all languages.
+        assert!(bnp.outputs.contains_key("USen"), "missing USen");
+        assert!(bnp.outputs.contains_key("EUfr"), "missing EUfr");
+        assert!(bnp.outputs.contains_key("CNzh"), "missing CNzh");
+
+        // Contaminated sections should have been stripped from all languages.
+        for (lang, out) in &bnp.outputs {
+            assert!(!out.entries.contains_key("EventFlowMsg/MiniGame_Crosscountry"),
+                "{lang} still has MiniGame_Crosscountry");
+            assert!(!out.entries.contains_key("EventFlowMsg/MiniGame_HorsebackArchery"),
+                "{lang} still has MiniGame_HorsebackArchery");
+
+            // Each language should have the Stormbreaker weapon entries.
+            let weapon_section = out.entries.get("ActorType/WeaponLargeSword")
+                .unwrap_or_else(|| panic!("{lang} missing ActorType/WeaponLargeSword"));
+            assert!(weapon_section.contains_key("Weapon_Lsword_700_Name"));
+            assert!(weapon_section.contains_key("Weapon_Lsword_700_Desc"));
+            assert!(weapon_section.contains_key("Weapon_Lsword_700_PictureBook"));
+
+            // Verify the Name entry content.
+            let name_entry = &weapon_section["Weapon_Lsword_700_Name"];
+            assert_eq!(name_entry.contents.len(), 1);
+            if let msyt::model::Content::Text(t) = &name_entry.contents[0] {
+                assert_eq!(t, "Stormbreaker");
+            } else {
+                panic!("{lang}: expected Text content for Name entry");
+            }
+        }
     }
 }
