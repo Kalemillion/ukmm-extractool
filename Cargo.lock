@@ -1209,6 +1209,7 @@ name = "ukmmsg2json"
 version = "0.1.3"
 dependencies = [
  "anyhow",
+ "atty",
  "indexmap 2.14.0",
  "msyt",
  "roead",

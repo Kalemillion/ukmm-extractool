@@ -642,13 +642,52 @@ fn write_output(out: &Output, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(out)?;
+    // The language is encoded in the filename (Msg_EUfr.product.json), so we
+    // strip it from the JSON body by serialising through a Value.
+    // Strip fields that are redundant (language in filename) or would
+    // cause false validation failures after manual edits (entry_count).
+    let mut val = serde_json::to_value(out)?;
+    if let Some(obj) = val.as_object_mut() {
+        obj.remove("language");
+        obj.remove("entry_count");
+    }
+    let json = serde_json::to_string_pretty(&val)?;
     fs::write(path, &json)?;
     eprintln!("  ✓ Wrote {} entries to {}", out.entries.len(), path.display());
     Ok(())
 }
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // If a .bnp file was passed as CLI argument or drag-dropped onto the exe,
+    // bypass the menu and go straight to BNP handling.
+    if let Some(arg) = args.first() {
+        let path = arg.trim_matches('"');
+        let p = Path::new(path);
+        if p.extension().is_some_and(|e| e == "bnp") && p.exists() {
+            return handle_bnp_interactive_for(path);
+        }
+    }
+
+    // On Linux, when launched by double-click, there's no terminal attached.
+    // Re-launch inside a terminal so the user can interact with the program.
+    if cfg!(target_os = "linux") && !atty::is(atty::Stream::Stdin) {
+        for term in ["xterm -e", "gnome-terminal --", "konsole -e", "xfce4-terminal --"] {
+            let parts: Vec<&str> = term.split_whitespace().collect();
+            let (cmd, args) = parts.split_first().unwrap_or((&"xterm", &[]));
+            let exe = std::env::current_exe()?;
+            let mut child = std::process::Command::new(cmd);
+            child.args(args);
+            child.arg(&exe);
+            if child.spawn().is_ok() {
+                // The new terminal window owns the interaction; this process exits.
+                return Ok(());
+            }
+        }
+        // No terminal found — fall through to interactive mode (will print nothing).
+    }
+
     let result = run_interactive();
     prompt("\nPress Enter to exit... ");
     result
@@ -658,12 +697,29 @@ fn main() -> Result<()> {
 ///
 /// Returns the trimmed line (without trailing newline). Returns empty string
 /// on any I/O error (e.g. EOF).
+///
+/// If the input looks like a `.bnp` file path (drag & drop at any prompt),
+/// the BNP workflow is launched immediately and the program exits.
 fn prompt(message: &str) -> String {
     print!("{message}");
     io::stdout().flush().ok();
     let mut line = String::new();
     io::stdin().lock().read_line(&mut line).ok();
-    line.trim().to_string()
+    let line = line.trim().to_string();
+
+    // Detect a .bnp file dropped at any prompt.
+    let path = line.trim_matches('"');
+    if Path::new(path).extension().is_some_and(|e| e == "bnp") && Path::new(path).exists() {
+        eprintln!();
+        let result = handle_bnp_interactive_for(path);
+        if let Err(e) = result {
+            eprintln!("Error: {e:#}");
+        }
+        prompt("\nPress Enter to exit... ");
+        std::process::exit(0);
+    }
+
+    line
 }
 
 /// Interactive checkbox-style multi-select prompt.
@@ -1214,6 +1270,8 @@ struct BnpData {
     platform: String,
     /// One `Output` per language, keyed by language code (e.g. `"USen"`, `"EUfr"`).
     outputs: BTreeMap<String, Output>,
+    /// `true` if at least one [`FILTER_SECTIONS`] entry was removed during parsing.
+    filtered_any: bool,
 }
 
 /// Convert a single BCML language block (section.msyt → entries) into our `Output`.
@@ -1299,16 +1357,18 @@ fn parse_bnp_bytes(data: &[u8]) -> Result<BnpData> {
         serde_json::from_slice(&json_bytes).context("Failed to parse BCML texts.json")?;
 
     let mut outputs: BTreeMap<String, Output> = BTreeMap::new();
+    let mut filtered_any = false;
     for (language, sections) in bcml {
         let mut out = bcml_lang_to_output(language.clone(), sections);
-        // Strip contaminated sections silently (the caller prints one summary line).
-        for section in FILTER_SECTIONS {
-            let _ = out.entries.remove(*section);
+        // The two bug sections always come together — check just the first.
+        if out.entries.remove(FILTER_SECTIONS[0]).is_some() {
+            out.entries.remove(FILTER_SECTIONS[1]);
+            filtered_any = true;
         }
         outputs.insert(language, out);
     }
 
-    Ok(BnpData { name, platform, outputs })
+    Ok(BnpData { name, platform, outputs, filtered_any })
 }
 
 /// Read, decompress, and parse a single message file into an `Output` struct.
@@ -1353,8 +1413,12 @@ fn convert_file(path: &str) -> Result<Output> {
 /// 6. If a workspace already exists, offer rebuild / extract-again / restore
 fn handle_bnp_interactive() -> Result<()> {
     let bnp_path = prompt("Drag & drop or enter path to .bnp file: ");
-    let bnp_path = bnp_path.trim_matches('"').to_string();
-    let path = Path::new(&bnp_path);
+    handle_bnp_interactive_for(bnp_path.trim_matches('"'))
+}
+
+/// Same as [`handle_bnp_interactive`] but takes the path directly (no prompt).
+fn handle_bnp_interactive_for(bnp_path: &str) -> Result<()> {
+    let path = Path::new(bnp_path);
     if !path.exists() {
         anyhow::bail!("File not found: {}", path.display());
     }
@@ -1363,16 +1427,17 @@ fn handle_bnp_interactive() -> Result<()> {
         anyhow::bail!("Expected a .bnp file, got .{ext}");
     }
 
-    let raw = fs::read(&bnp_path)?;
+    let raw = fs::read(bnp_path)?;
     if raw.len() <= BNP_MAGIC.len() || raw[..BNP_MAGIC.len()] != *BNP_MAGIC {
         anyhow::bail!("File does not appear to be a valid 7z archive (missing 7z magic)");
     }
 
-    eprintln!("Found a .bnp file. Parsing contents...");
     let bnp = parse_bnp_bytes(&raw)?;
 
-    println!("  ✓ Removed BCML's entry bugs 'EventFlowMsg/MiniGame_Crosscountry' \
-& 'EventFlowMsg/MiniGame_HorsebackArchery'");
+    if bnp.filtered_any {
+        println!("  ✓ Removed BCML's entry bugs 'EventFlowMsg/MiniGame_Crosscountry' \
+    & 'EventFlowMsg/MiniGame_HorsebackArchery'");
+    }
 
     let mod_name = sanitize_filename(&bnp.name);
     let platform = &bnp.platform;
@@ -1400,20 +1465,20 @@ fn handle_bnp_interactive() -> Result<()> {
     };
 
     if action == "rebuild" {
-        let r = run_bnp_rebuild(&mod_name, &mods_out_dir, &bnp_path, &backup_path, path);
+        let r = run_bnp_rebuild(&mod_name, &mods_out_dir, bnp_path, &backup_path, path);
         open_explorer(&mods_out_dir);
         return r;
     }
 
     if action == "restore" {
-        let r = run_bnp_restore(&backup_path, &bnp_path, path);
+        let r = run_bnp_restore(&backup_path, bnp_path, path);
         open_explorer(&mods_out_dir);
         return r;
     }
 
     // ── Ask output format ─────────────────────────────────────────────────
-    println!("\nAvailable languages: {}\n", bnp.outputs.keys().cloned().collect::<Vec<_>>().join(", "));
-    let mode = prompt("Output format:\n[1] Unique texts.json (1 for all lang; bcml-like)\n[2] Multiple language files (1 lang = 1 file)\n\nSelect 1 or 2 (default = 1): ");
+    println!("bnp mod activated\n\nAvailable languages: {}\n", bnp.outputs.keys().cloned().collect::<Vec<_>>().join(", "));
+    let mode = prompt("Output format:\n[1] Unique texts.json (all lang => 1 file ; bcml-like)\n[2] Multiple language files (1 lang = 1 file)\n\nSelect 1 or 2 (default = 1): ");
 
     if mode.trim() == "1" {
         // ── Interactive checkbox selection of languages ──────────────────────
@@ -1447,7 +1512,7 @@ fn handle_bnp_interactive() -> Result<()> {
         eprintln!("  ✓ Wrote {} languages to {}", selected.len(), output_path.display());
 
         fs::create_dir_all(&mods_out_dir)?;
-        fs::copy(&bnp_path, &backup_path)?;
+        fs::copy(bnp_path, &backup_path)?;
         println!("  ✓ Backup saved: {}", backup_path.display());
 
         println!("\n── Summary ──");
@@ -1484,7 +1549,7 @@ fn handle_bnp_interactive() -> Result<()> {
 
     // ── Save backup ───────────────────────────────────────────────────────
     fs::create_dir_all(&mods_out_dir)?;
-    fs::copy(&bnp_path, &backup_path)?;
+    fs::copy(bnp_path, &backup_path)?;
     println!("  ✓ Backup saved: {}", backup_path.display());
 
     // ── Summary ───────────────────────────────────────────────────────────
