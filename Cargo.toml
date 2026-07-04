@@ -2,7 +2,7 @@
 name = "ukmmsg2json"
 version = "0.1.3"
 edition = "2021"
-description = "Convert UKMM .sarc files (text) to readable and editable json"
+description = "Convert UKMM .sarc files (text) to readable and editable yaml"
 repository = "https://github.com/Kalemillion/ukmmsg2json"
 license = "MIT"
 

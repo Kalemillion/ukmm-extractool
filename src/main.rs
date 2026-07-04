@@ -647,7 +647,7 @@ fn parse_cbor(data: &[u8]) -> Result<Output> {
     Ok(Output { language: None, entry_count: None, entries, format: None })
 }
 
-/// Serialize an `Output` struct to pretty-printed JSON and write to a file.
+/// Serialize an `Output` struct to YAML and write to a file.
 ///
 /// Creates parent directories if they don't exist. Prints a confirmation
 /// message to stderr (so stdout stays clean for pipe usage).
@@ -662,8 +662,8 @@ fn write_output(out: &Output, path: &Path) -> Result<()> {
         obj.remove("language");
         obj.remove("entry_count");
     }
-    let json = serde_json::to_string_pretty(&val)?;
-    fs::write(path, &json)?;
+    let yaml = serde_yaml::to_string(&val)?;
+    fs::write(path, &yaml)?;
     eprintln!("  ✓ Wrote {} entries to {}", out.entries.len(), path.display());
     Ok(())
 }
@@ -701,8 +701,8 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                // ── Other formats → JSON (unchanged) ─────────────────────
-                let output_path = p.with_file_name(format!("{stem}.json"));
+                // ── Other formats → YAML ──────────────────────────────────
+                let output_path = p.with_file_name(format!("{stem}.yaml"));
                 write_output(&out, &output_path)?;
                 println!("\nDone!\n");
                 return Ok(());
@@ -864,7 +864,7 @@ fn read_meta_name(meta_path: &Path) -> Option<String> {
     None
 }
 
-/// Recursively check if a directory contains any .json or .sbyml files.
+/// Recursively check if a directory contains any .yaml or .sbyml files.
 fn has_json_or_sbyml_recursive(dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else { return false };
     for entry in entries.flatten() {
@@ -874,7 +874,7 @@ fn has_json_or_sbyml_recursive(dir: &Path) -> bool {
                 return true;
             }
         } else if let Some(ext) = path.extension().and_then(|x| x.to_str()) {
-            if ext == "json" || ext == "sbyml" {
+            if ext == "yaml" || ext == "sbyml" {
                 return true;
             }
         }
@@ -882,7 +882,7 @@ fn has_json_or_sbyml_recursive(dir: &Path) -> bool {
     false
 }
 
-/// Recursively collect all .json and .sbyml files under `dir`.
+/// Recursively collect all .yaml and .sbyml files under `dir`.
 fn collect_edited_files(dir: &Path, files: &mut Vec<PathBuf>) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -890,7 +890,7 @@ fn collect_edited_files(dir: &Path, files: &mut Vec<PathBuf>) {
             if path.is_dir() {
                 collect_edited_files(&path, files);
             } else if let Some(ext) = path.extension().and_then(|x| x.to_str()) {
-                if ext == "json" || ext == "sbyml" {
+                if ext == "yaml" || ext == "sbyml" {
                     files.push(path);
                 }
             }
@@ -1061,7 +1061,7 @@ fn run_interactive() -> Result<()> {
         let sarc_path = msg_file.display().to_string();
         let relative = msg_file.strip_prefix(&extract_dir).unwrap_or(msg_file);
         // Keep subdirectory structure (e.g. "Message/Msg_EUfr.product")
-        let output_path = mods_out_dir.join(relative).with_extension("json");
+        let output_path = mods_out_dir.join(relative).with_extension("yaml");
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1078,7 +1078,7 @@ fn run_interactive() -> Result<()> {
         let parent_dir = mods_out_dir.join(relative).parent().unwrap_or(&mods_out_dir).to_path_buf();
         fs::create_dir_all(&parent_dir)?;
 
-        // ActorInfo → .sbyml natif, autres BYML → .json
+        // ActorInfo → .sbyml natif, autres BYML → .yaml
         if out.format.as_deref() == Some("ActorInfo") {
             let compressed = actorinfo_output_to_sbyml(&out)?;
             let mut sbyml_name = mods_out_dir.join(relative);
@@ -1086,7 +1086,7 @@ fn run_interactive() -> Result<()> {
             fs::write(&sbyml_name, &compressed)?;
             eprintln!("  ✓ Converted to native BYML: {}", sbyml_name.display());
         } else {
-            let output_path = mods_out_dir.join(relative).with_extension("json");
+            let output_path = mods_out_dir.join(relative).with_extension("yaml");
             write_output(&out, &output_path)?;
         }
     }
@@ -1162,10 +1162,12 @@ fn run_rebuild(mod_name: &str, mods_out_dir: &Path, _mod_dir_arg: &str, mod_path
             continue;
         }
 
-        // ── .json ────────────────────────────────────────────────────────
-        let json_text = fs::read_to_string(file_path)?;
-        let out: Output = serde_json::from_str(&json_text)
+        // ── .yaml ───────────────────────────────────────────────────────
+        let yaml_text = fs::read_to_string(file_path)?;
+        let val: serde_json::Value = serde_yaml::from_str(&yaml_text)
             .with_context(|| format!("Failed to parse {}.", file_path.display()))?;
+        let out: Output = serde_json::from_value(val)
+            .with_context(|| format!("Failed to convert YAML {} to Output.", file_path.display()))?;
 
         if out.format.as_deref() == Some("BYML") {
             let byml_bytes = rebuild_byml_from_output(&out)?;
