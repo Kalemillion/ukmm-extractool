@@ -768,52 +768,6 @@ fn prompt(message: &str) -> String {
 /// Shows `items` with `[ ]` / `[x]` markers. The user enters a number to
 /// toggle an item and presses Enter (empty input) to confirm.
 /// Returns the list of selected items.
-fn prompt_checkbox_selection(items: &[String], header: &str) -> Vec<String> {
-    let n = items.len();
-
-    println!("\n{header}");
-    for (i, item) in items.iter().enumerate() {
-        println!("  [{:2}]  {item}", i + 1);
-    }
-    println!("  [all]  Select / deselect all");
-
-    let input = prompt("Enter numbers (comma-separated, ranges like 1-5, or 'all'): ");
-    let input = input.trim().to_lowercase();
-
-    if input == "all" {
-        return items.to_vec();
-    }
-
-    let mut selected = vec![false; n];
-
-    // Accept commas, semicolons or spaces as separators.
-    for part in input.split(&[',', ';', ' '][..]) {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-
-        if let Some((a, b)) = part.split_once('-') {
-            let lo = a.trim().parse::<usize>().unwrap_or(1).max(1).min(n);
-            let hi = b.trim().parse::<usize>().unwrap_or(n).max(1).min(n);
-            for i in lo..=hi {
-                selected[i - 1] = true;
-            }
-        } else if let Ok(num) = part.parse::<usize>() {
-            if num >= 1 && num <= n {
-                selected[num - 1] = true;
-            }
-        }
-    }
-
-    items
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| selected[*i])
-        .map(|(_, item)| item.clone())
-        .collect()
-}
-
 /// Resolve the UKMM data directory based on platform conventions.
 ///
 /// Resolution order:
@@ -926,7 +880,36 @@ fn run_interactive() -> Result<()> {
     println!("  [1] Wii U");
     println!("  [2] Switch");
     println!("  [3] Load a .bnp file");
-    let plat_choice = prompt("\nSelect 1, 2 or 3 (default = 1): ");
+    println!("  [4] Info");
+    let plat_choice = prompt("\nSelect 1, 2, 3 or 4 (default = 1): ");
+
+    // Option 4: show info.
+    if plat_choice == "4" {
+        println!();
+        println!("╔════════════════════════════════════════════════╗");
+        println!("║              ukmmsg2json v{}", env!("CARGO_PKG_NAME"));
+        println!("╠════════════════════════════════════════════════╣");
+        println!("║  Extracts UKMM Message/*.sarc files to         ║");
+        println!("║  .yaml, Actor/*.byml to .sbyml, and back,      ║");
+        println!("║  for both Wii U and Switch.                    ║");
+        println!("║                                                ║");
+        println!("║  Supports their BCML .bnp counterpart the      ║");
+        println!("║  same way (logs/actorinfo.yml. & texts.json)   ║");
+        println!("║                                                ║");
+        println!("║  ActorInfo .sbyml files should be edited       ║");
+        println!("║  with TotkBits:                                ║");
+        println!("║  https://github.com/SolidLink95/TotkBits       ║");
+        println!("║                                                ║");
+        println!("║  Supported formats:                            ║");
+        println!("║    - .byml / .sbyml                            ║");
+        println!("║    - UKMM's .sarc                              ║");
+        println!("║    - .yml                                      ║");
+        println!("║    - .json                                     ║");
+        println!("╚════════════════════════════════════════════════╝");
+        println!();
+        prompt("Press Enter to continue... ");
+        return run_interactive();
+    }
 
     // Option 3: process a .bnp file with full workspace management.
     if plat_choice == "3" {
@@ -1476,21 +1459,19 @@ fn bcml_lang_to_output(language: String, sections: BTreeMap<String, serde_json::
     }
 }
 
-/// Build a BCML-format `{ lang: { section.msyt: entries } }` map from selected
-/// languages in a BNP. This exactly reproduces the original `logs/texts.json` structure.
-fn build_bcml_texts(bnp: &BnpData, selected: &[String]) -> BTreeMap<String, serde_json::Value> {
+/// Build a BCML-format `{ lang: { section.msyt: entries } }` map with all
+/// languages from a BNP. This exactly reproduces the original `logs/texts.json` structure.
+fn build_bcml_texts(outputs: &BTreeMap<String, Output>) -> BTreeMap<String, serde_json::Value> {
     let mut bcml: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-    for lang in selected {
-        if let Some(out) = bnp.outputs.get(lang.as_str()) {
-            let mut sections: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-            for (section_name, entries) in &out.entries {
-                let msyt_name = format!("{section_name}.msyt");
-                sections.insert(msyt_name, serde_json::to_value(entries).unwrap_or_default());
-            }
-            bcml.insert(lang.clone(), serde_json::Value::Object(
-                sections.into_iter().collect()
-            ));
+    for (lang, out) in outputs {
+        let mut sections: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        for (section_name, entries) in &out.entries {
+            let msyt_name = format!("{section_name}.msyt");
+            sections.insert(msyt_name, serde_json::to_value(entries).unwrap_or_default());
         }
+        bcml.insert(lang.clone(), serde_json::Value::Object(
+            sections.into_iter().collect()
+        ));
     }
     bcml
 }
@@ -2310,27 +2291,18 @@ fn handle_bnp_interactive_for(bnp_path: &str) -> Result<()> {
         return r;
     }
 
-    // ── Interactive checkbox selection of languages ──────────────────────
-    println!("bnp mod activated\n\nAvailable languages: {}\n", bnp.outputs.keys().cloned().collect::<Vec<_>>().join(", "));
-    let lang_keys: Vec<String> = bnp.outputs.keys().cloned().collect();
-    let selected = prompt_checkbox_selection(
-        &lang_keys,
-        "Select languages (enter number to toggle, Enter to confirm):",
-    );
-    if selected.is_empty() {
-        anyhow::bail!("No languages selected.");
-    }
+    // ── Extract all languages ────────────────────────────────────────────
+    println!("bnp mod activated\n\nLanguages: {}\n", bnp.outputs.keys().cloned().collect::<Vec<_>>().join(", "));
+    println!("── Converting BNP ──\n");
 
-    // ── Build BCML-format texts.json ─────────────────────────────────────
-    println!("\n── Converting BNP ──\n");
-
-    let bcml = build_bcml_texts(&bnp, &selected);
+    let all_langs: Vec<String> = bnp.outputs.keys().cloned().collect();
+    let bcml = build_bcml_texts(&bnp.outputs);
     let json_text = serde_json::to_string_pretty(&bcml)?;
     fs::create_dir_all(&mods_out_dir)?;
     let logs_dir = mods_out_dir.join("logs");
     fs::create_dir_all(&logs_dir)?;
     fs::write(logs_dir.join("texts.json"), &json_text)?;
-    eprintln!("  ✓ Wrote {} languages to logs/texts.json", selected.len());
+    eprintln!("  ✓ Wrote {} languages to logs/texts.json", all_langs.len());
 
     // ── Write ActorInfo YAML (preserve original format) ───────────────────
     if let Some(ref actor_yaml) = bnp.actorinfo_yaml {
@@ -2346,7 +2318,7 @@ fn handle_bnp_interactive_for(bnp_path: &str) -> Result<()> {
     println!("\n── Summary ──");
     println!("  Platform:     {platform}");
     println!("  Mod:          {}", bnp.name);
-    println!("  Languages:    {}", selected.len());
+    println!("  Languages:    {}", all_langs.len());
     println!("  Output:       {}", mods_out_dir.display());
     println!("  Backup:       {backup_name}");
     println!();
