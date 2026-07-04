@@ -1435,6 +1435,8 @@ struct BnpData {
     platform: String,
     /// One `Output` per language, keyed by language code (e.g. `"USen"`, `"EUfr"`).
     outputs: BTreeMap<String, Output>,
+    /// Raw YAML string from `logs/actorinfo.yml` (if present in the BNP).
+    actorinfo_yaml: Option<String>,
     /// `true` if at least one [`FILTER_SECTIONS`] entry was removed during parsing.
     filtered_any: bool,
 }
@@ -1472,10 +1474,30 @@ fn bcml_lang_to_output(language: String, sections: BTreeMap<String, serde_json::
     }
 }
 
+/// Build a BCML-format `{ lang: { section.msyt: entries } }` map from selected
+/// languages in a BNP. This exactly reproduces the original `logs/texts.json` structure.
+fn build_bcml_texts(bnp: &BnpData, selected: &[String]) -> BTreeMap<String, serde_json::Value> {
+    let mut bcml: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for lang in selected {
+        if let Some(out) = bnp.outputs.get(lang.as_str()) {
+            let mut sections: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            for (section_name, entries) in &out.entries {
+                let msyt_name = format!("{section_name}.msyt");
+                sections.insert(msyt_name, serde_json::to_value(entries).unwrap_or_default());
+            }
+            bcml.insert(lang.clone(), serde_json::Value::Object(
+                sections.into_iter().collect()
+            ));
+        }
+    }
+    bcml
+}
+
 /// Parse a BCML `.bnp` archive (a 7z file) into a `BnpData`.
 ///
-/// Extracts `info.json` (for name & platform) and `logs/texts.json` (for all
-/// language entries). Each language in the BCML JSON becomes a separate `Output`.
+/// Extracts `info.json` (for name & platform), `logs/texts.json` (for all
+/// language entries), and `logs/actorinfo.yml` (ActorInfo data, if present).
+/// Each language in the BCML JSON becomes a separate `Output`.
 fn parse_bnp_bytes(data: &[u8]) -> Result<BnpData> {
     let len = data.len() as u64;
     let cursor = Cursor::new(data.to_vec());
@@ -1484,6 +1506,7 @@ fn parse_bnp_bytes(data: &[u8]) -> Result<BnpData> {
 
     let mut info_json: Option<Vec<u8>> = None;
     let mut texts_json: Option<Vec<u8>> = None;
+    let mut actorinfo_yaml_raw: Option<Vec<u8>> = None;
 
     reader
         .for_each_entries(|entry, entry_reader| {
@@ -1492,6 +1515,7 @@ fn parse_bnp_bytes(data: &[u8]) -> Result<BnpData> {
             match entry.name() {
                 "info.json" => info_json = Some(buf),
                 "logs/texts.json" => texts_json = Some(buf),
+                "logs/actorinfo.yml" => actorinfo_yaml_raw = Some(buf),
                 _ => {}
             }
             Ok(true)
@@ -1514,12 +1538,14 @@ fn parse_bnp_bytes(data: &[u8]) -> Result<BnpData> {
         .unwrap_or("wiiu")
         .to_string();
 
-    let json_bytes =
-        texts_json.ok_or_else(|| anyhow::anyhow!("BNP archive missing logs/texts.json"))?;
+    // Parse actorinfo.yml if present.
+    let actorinfo_yaml = actorinfo_yaml_raw
+        .map(|b| String::from_utf8_lossy(&b).to_string());
 
-    // BCML format: { lang: { section.msyt: { entries... } } }
+    // Parse BCML texts.json.
+    let json_bytes: &[u8] = &texts_json.ok_or_else(|| anyhow::anyhow!("BNP archive missing logs/texts.json"))?;
     let bcml: BTreeMap<String, BTreeMap<String, serde_json::Value>> =
-        serde_json::from_slice(&json_bytes).context("Failed to parse BCML texts.json")?;
+        serde_json::from_slice(json_bytes).context("Failed to parse BCML texts.json")?;
 
     let mut outputs: BTreeMap<String, Output> = BTreeMap::new();
     let mut filtered_any = false;
@@ -1533,7 +1559,7 @@ fn parse_bnp_bytes(data: &[u8]) -> Result<BnpData> {
         outputs.insert(language, out);
     }
 
-    Ok(BnpData { name, platform, outputs, filtered_any })
+    Ok(BnpData { name, platform, outputs, actorinfo_yaml, filtered_any })
 }
 
 /// Parse raw BYML bytes into a `serde_json::Value`.
@@ -2124,6 +2150,21 @@ fn parse_byml_actorinfo(data: &[u8], path: &str) -> Result<Output> {
     })
 }
 
+/// Parse an ActorInfo YAML string (TotkBits/Bubble-Wrap BNP export format) into
+/// an `Output` with the unfolded structure.
+///
+/// The YAML format has actor hashes as top-level keys, each containing a flat map
+/// of properties (no "Map"/"Array" serde wrappers). We convert each property value
+/// to the roead serde JSON format.
+///
+/// Example input:
+/// ```yaml
+/// '87080573':
+///   name: Weapon_Lsword_700
+///   attackPower: 80
+///   generalLife: 99
+///   tags: { tag2755f107: 659943687, tagb0c9e79a: !u 0xb0c9e79a }
+/// ```
 /// Read, decompress, and parse a single message file into an `Output` struct.
 ///
 /// This is the same pipeline as `main()` uses for forward conversion,
@@ -2236,19 +2277,16 @@ fn handle_bnp_interactive_for(bnp_path: &str) -> Result<()> {
     let mod_name = sanitize_filename(&bnp.name);
     let platform = &bnp.platform;
     let mods_out_dir = PathBuf::from("mods").join(platform).join(&mod_name);
+    let logs_dir = mods_out_dir.join("logs");
     let backup_name = format!("{mod_name}_backup.bnp");
     let backup_path = mods_out_dir.join(&backup_name);
 
     // ── Check for existing workspace ───────────────────────────────────────
     let workspace_exists = backup_path.is_file()
-        && mods_out_dir.read_dir()
-            .map(|mut d| d.any(|e| e.as_ref().is_ok_and(|e| {
-                e.path().extension().is_some_and(|x| x == "json")
-            })))
-            .unwrap_or(false);
+        && logs_dir.join("texts.json").is_file();
 
     let action = if workspace_exists {
-        let a = prompt("\nA workspace exists for this mod. What to do with it?\n[1] Send .json into BNP\n[2] Extract again (BNP > .json)\n[3] Restore original (from backup)\n\n(default = 1): ");
+        let a = prompt("\nA workspace exists for this mod. What to do with it?\n[1] Send edited files into BNP\n[2] Extract again (BNP > YAML)\n[3] Restore original (from backup)\n\n(default = 1): ");
         match a.trim() {
             "2" => "extract",
             "3" => "restore",
@@ -2270,79 +2308,35 @@ fn handle_bnp_interactive_for(bnp_path: &str) -> Result<()> {
         return r;
     }
 
-    // ── Ask output format ─────────────────────────────────────────────────
+    // ── Interactive checkbox selection of languages ──────────────────────
     println!("bnp mod activated\n\nAvailable languages: {}\n", bnp.outputs.keys().cloned().collect::<Vec<_>>().join(", "));
-    let mode = prompt("Output format:\n[1] Unique texts.json (all lang => 1 file ; bcml-like)\n[2] Multiple language files (1 lang = 1 file)\n\nSelect 1 or 2 (default = 1): ");
-
-    if mode.trim() == "1" {
-        // ── Interactive checkbox selection of languages ──────────────────────
-        let lang_keys: Vec<String> = bnp.outputs.keys().cloned().collect();
-        let selected = prompt_checkbox_selection(
-            &lang_keys,
-            "Select languages (enter number to toggle, Enter to confirm):",
-        );
-        if selected.is_empty() {
-            anyhow::bail!("No languages selected.");
-        }
-
-        // Build BCML-format JSON: { lang: { section.msyt: entries } }
-        let mut bcml: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-        for lang in &selected {
-            let out = &bnp.outputs[lang.as_str()];
-            let mut sections: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-            for (section_name, entries) in &out.entries {
-                let msyt_name = format!("{section_name}.msyt");
-                sections.insert(msyt_name, serde_json::to_value(entries).unwrap_or_default());
-            }
-            bcml.insert((*lang).clone(), serde_json::Value::Object(
-                sections.into_iter().collect()
-            ));
-        }
-
-        let json_text = serde_json::to_string_pretty(&bcml)?;
-        fs::create_dir_all(&mods_out_dir)?;
-        let output_path = mods_out_dir.join("texts.json");
-        fs::write(&output_path, &json_text)?;
-        eprintln!("  ✓ Wrote {} languages to {}", selected.len(), output_path.display());
-
-        fs::create_dir_all(&mods_out_dir)?;
-        fs::copy(bnp_path, &backup_path)?;
-        println!("  ✓ Backup saved: {}", backup_path.display());
-
-        println!("\n── Summary ──");
-        println!("  Platform:     {platform}");
-        println!("  Mod:          {}", bnp.name);
-        println!("  Languages:    {}", selected.len());
-        println!("  Output:       {}", output_path.display());
-        println!("  Backup:       {backup_name}");
-        println!();
-        open_explorer(&mods_out_dir);
-        return Ok(());
-    }
-
-    // ── Individual Msg_<lang>.product.json for selected languages ────────
     let lang_keys: Vec<String> = bnp.outputs.keys().cloned().collect();
     let selected = prompt_checkbox_selection(
         &lang_keys,
-        "Select languages to extract (enter number to toggle, Enter to confirm):",
+        "Select languages (enter number to toggle, Enter to confirm):",
     );
     if selected.is_empty() {
         anyhow::bail!("No languages selected.");
     }
 
-    println!("\n── Converting BNP to JSON ──\n");
-    fs::create_dir_all(&mods_out_dir)?;
+    // ── Build BCML-format texts.json ─────────────────────────────────────
+    println!("\n── Converting BNP ──\n");
 
-    for lang in &selected {
-        if let Some(out) = bnp.outputs.get(lang) {
-            let stem = format!("Msg_{lang}.product");
-            let output_path = mods_out_dir.join(format!("{stem}.json"));
-            write_output(out, &output_path)?;
-        }
+    let bcml = build_bcml_texts(&bnp, &selected);
+    let json_text = serde_json::to_string_pretty(&bcml)?;
+    fs::create_dir_all(&mods_out_dir)?;
+    let logs_dir = mods_out_dir.join("logs");
+    fs::create_dir_all(&logs_dir)?;
+    fs::write(logs_dir.join("texts.json"), &json_text)?;
+    eprintln!("  ✓ Wrote {} languages to logs/texts.json", selected.len());
+
+    // ── Write ActorInfo YAML (preserve original format) ───────────────────
+    if let Some(ref actor_yaml) = bnp.actorinfo_yaml {
+        fs::write(logs_dir.join("actorinfo.yml"), actor_yaml)?;
+        eprintln!("  ✓ Extracted logs/actorinfo.yml");
     }
 
     // ── Save backup ───────────────────────────────────────────────────────
-    fs::create_dir_all(&mods_out_dir)?;
     fs::copy(bnp_path, &backup_path)?;
     println!("  ✓ Backup saved: {}", backup_path.display());
 
@@ -2359,56 +2353,31 @@ fn handle_bnp_interactive_for(bnp_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Rebuild a .bnp archive from edited JSON files.
+/// Rebuild a .bnp archive from edited files.
 ///
-/// Reads all `Msg_*.product.json` files from the workspace, reconstructs the
-/// BCML `texts.json` format, then extracts the original backup to a temp dir,
-/// replaces `logs/texts.json`, and re-compresses to a new `.bnp`.
+/// Reads `logs/texts.json` and `logs/actorinfo.yml` from the workspace,
+/// then extracts the backup to a temp dir, replaces the files, and
+/// re-compresses to a new `.bnp`.
 fn run_bnp_rebuild(mod_name: &str, mods_out_dir: &Path, _orig_bnp_path: &str, backup_path: &Path, orig_path: &Path) -> Result<()> {
-    println!("\n── Rebuilding BNP from edited JSONs ──\n");
+    println!("\n── Rebuilding BNP from edited files ──\n");
 
-    // ── Collect JSON files ────────────────────────────────────────────────
-    let json_files: Vec<PathBuf> = match fs::read_dir(mods_out_dir) {
-        Ok(entries) => entries
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-            .map(|e| e.path())
-            .collect(),
-        Err(_) => vec![],
+    let logs_dir = mods_out_dir.join("logs");
+
+    // ── Read texts.json ───────────────────────────────────────────────────
+    let texts_path = logs_dir.join("texts.json");
+    if !texts_path.is_file() {
+        anyhow::bail!("No logs/texts.json found in {}.", mods_out_dir.display());
+    }
+    let new_texts = fs::read_to_string(&texts_path)?;
+    println!("  ✓ Read logs/texts.json");
+
+    // ── Read actorinfo.yml if present ─────────────────────────────────────
+    let actorinfo_path = logs_dir.join("actorinfo.yml");
+    let actorinfo_yaml_str: Option<String> = if actorinfo_path.is_file() {
+        Some(fs::read_to_string(&actorinfo_path)?)
+    } else {
+        None
     };
-
-    if json_files.is_empty() {
-        anyhow::bail!("No JSON files found in {}.", mods_out_dir.display());
-    }
-
-    // ── Reconstruct BCML texts.json ───────────────────────────────────────
-    let mut bcml: BTreeMap<String, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
-
-    for json_path in &json_files {
-        let stem = json_path.file_stem().and_then(OsStr::to_str).unwrap_or("");
-        // Extract language from "Msg_USen.product" → "USen".
-        let language = stem
-            .strip_prefix("Msg_")
-            .and_then(|s| s.strip_suffix(".product"))
-            .unwrap_or(stem)
-            .to_string();
-
-        let json_text = fs::read_to_string(json_path)?;
-        let out: Output = serde_json::from_str(&json_text)
-            .with_context(|| format!("Failed to parse {}", json_path.display()))?;
-
-        // Re-add .msyt to section names.
-        let mut sections: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-        for (section_name, entries) in &out.entries {
-            let msyt_name = format!("{section_name}.msyt");
-            let entries_val = serde_json::to_value(entries)
-                .with_context(|| format!("Failed to serialize entries for {section_name}"))?;
-            sections.insert(msyt_name, entries_val);
-        }
-        bcml.insert(language, sections);
-    }
-
-    let new_texts = serde_json::to_string_pretty(&bcml)?;
 
     // ── Check if original .bnp has been moved ─────────────────────────────
     let bnp_moved = !orig_path.exists();
@@ -2438,6 +2407,12 @@ fn run_bnp_rebuild(mod_name: &str, mods_out_dir: &Path, _orig_bnp_path: &str, ba
     let texts_dir = temp_dir.join("logs");
     fs::create_dir_all(&texts_dir)?;
     fs::write(texts_dir.join("texts.json"), &new_texts)?;
+
+    // ── Write ActorInfo YAML if present ────────────────────────────────────
+    if let Some(ref actor_yaml) = actorinfo_yaml_str {
+        fs::write(texts_dir.join("actorinfo.yml"), actor_yaml)?;
+        println!("  ✓ Updated logs/actorinfo.yml");
+    }
 
     // Re-compress the temp directory to a new .bnp.
     eprintln!("Compressing rebuilt BNP...");
