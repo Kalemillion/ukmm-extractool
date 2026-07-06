@@ -1,9 +1,9 @@
 [package]
-name = "ukmmsg2json"
-version = "0.1.4"
+name = "ukmm-extractool"
+version = "0.2.0"
 edition = "2021"
-description = "Convert UKMM .sarc files (text) to readable and editable yaml"
-repository = "https://github.com/Kalemillion/ukmmsg2json"
+description = "Extract and rebuild UKMM mod files (.byml/.sarc/.bnp) to/from editable YAML and native BYML"
+repository = "https://github.com/Kalemillion/ukmm-extractool"
 license = "MIT"
 
 [dependencies]

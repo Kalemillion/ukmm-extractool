@@ -49,27 +49,27 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          BINARY="target/${{ matrix.target }}/release/ukmmsg2json"
+          BINARY="target/${{ matrix.target }}/release/ukmm-extractool"
           chmod +x "$BINARY"
           cp "$BINARY" dist/
           cp README.md dist/
           cd dist
-          tar czf "../ukmmsg2json-${{ matrix.target }}.tar.gz" *
+          tar czf "../ukmm-extractool-${{ matrix.target }}.tar.gz" *
 
       - name: Prepare artifacts (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
-          Copy-Item "target/${{ matrix.target }}/release/ukmmsg2json.exe" dist/
+          Copy-Item "target/${{ matrix.target }}/release/ukmm-extractool.exe" dist/
           Copy-Item README.md dist/
-          Compress-Archive -Path dist/* -DestinationPath "ukmmsg2json-${{ matrix.target }}.zip"
+          Compress-Archive -Path dist/* -DestinationPath "ukmm-extractool-${{ matrix.target }}.zip"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ukmmsg2json-${{ matrix.target }}
-          path: ukmmsg2json-${{ matrix.target }}.*
+          name: ukmm-extractool-${{ matrix.target }}
+          path: ukmm-extractool-${{ matrix.target }}.*
           if-no-files-found: error
 
   release:
@@ -95,7 +95,7 @@ jobs:
             echo ""
             echo "| Platform | Archive |"
             echo "|----------|---------|"
-            for f in artifacts/*/ukmmsg2json-*; do
+            for f in artifacts/*/ukmm-extractool-*; do
               name=$(basename "$f")
               echo "| \`$name\` | Download below |"
             done
@@ -104,14 +104,14 @@ jobs:
             echo ""
             echo 'Just run the program — it launches in interactive mode and guides you through the process.'
             echo ""
-            echo "- \`ukmmsg2json\` / \`ukmmsg2json.exe\` — portable binary (no dependencies needed)"
+            echo "- \`ukmm-extractool\` / \`ukmm-extractool.exe\` — portable binary (no dependencies needed)"
             echo "- \`README.md\` — full documentation"
           } > release_body.md
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "ukmmsg2json ${{ github.ref_name }}"
+          name: "ukmm-extractool ${{ github.ref_name }}"
           body_path: release_body.md
           files: |
             artifacts/**/*

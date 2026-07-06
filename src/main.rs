@@ -1,6 +1,7 @@
-//! # ukmmsg2json
+//! # ukmm-extractool
 //!
-//! Converts UKMM (UK Mod Manager) `Msg_*.product.sarc` files to editable JSON and back.
+//! Extracts and rebuilds UKMM mod files (`.byml`/`.sarc`/`.bnp`) to/from
+//! editable YAML and native BYML — messages, actor info, generic mergeables.
 //!
 //! The only entry point is **interactive mode** (`-i`), which scans installed UKMM mods,
 //! lets the user pick one, extracts the single `Msg_*.product.sarc` inside the ZIP,
@@ -776,7 +777,7 @@ fn main() -> Result<()> {
         }
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
-            "bnp" => return handle_bnp_interactive_for(path),
+            "bnp" | "7z" => return handle_bnp_interactive_for(path),
             "byml" | "sbyml" => {
                 let out = convert_file(path)?;
                 let stem = filename_stem(p);
@@ -824,9 +825,24 @@ fn main() -> Result<()> {
         // No terminal found — fall through to interactive mode (will print nothing).
     }
 
-    let result = run_interactive();
-    prompt("\nPress Enter to exit... ");
-    result
+    // ── Main menu loop ───────────────────────────────────────────────────
+    loop {
+        let result = run_interactive();
+        match &result {
+            Ok(()) => {
+                prompt("\nPress Enter to return to menu... ");
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains("Return to menu.") {
+                    // Cancel or no mods found — go back to menu.
+                    continue;
+                }
+                eprintln!("Error: {e:#}");
+                prompt("\nPress Enter to retry... ");
+            }
+        }
+    }
 }
 
 /// Print a prompt to stdout, flush, and read a single line from stdin.
@@ -834,7 +850,7 @@ fn main() -> Result<()> {
 /// Returns the trimmed line (without trailing newline). Returns empty string
 /// on any I/O error (e.g. EOF).
 ///
-/// If the input looks like a `.bnp` file path (drag & drop at any prompt),
+/// If the input looks like a `.bnp` or `.7z` file path (drag & drop at any prompt),
 /// the BNP workflow is launched immediately and the program exits.
 fn prompt(message: &str) -> String {
     print!("{message}");
@@ -843,9 +859,9 @@ fn prompt(message: &str) -> String {
     io::stdin().lock().read_line(&mut line).ok();
     let line = line.trim().to_string();
 
-    // Detect a .bnp file dropped at any prompt.
+    // Detect a .bnp / .7z file dropped at any prompt.
     let path = line.trim_matches('"');
-    if Path::new(path).extension().is_some_and(|e| e == "bnp") && Path::new(path).exists() {
+    if Path::new(path).extension().is_some_and(|e| e == "bnp" || e == "7z") && Path::new(path).exists() {
         eprintln!();
         let result = handle_bnp_interactive_for(path);
         if let Err(e) = result {
@@ -962,7 +978,7 @@ fn collect_edited_files(dir: &Path, files: &mut Vec<PathBuf>) {
 fn run_interactive() -> Result<()> {
     println!();
     println!("╔═════════════════════════╗");
-    println!("║       ukmmsg2json       ║");
+    println!("║     ukmm-extractool     ║");
     println!("╚═════════════════════════╝");
     println!();
 
@@ -971,35 +987,47 @@ fn run_interactive() -> Result<()> {
     let nx_path = ukmm_root.join("nx").join("mods");
 
     // ── Platform / Source selection ───────────────────────────────────────
-    println!("Choose your platform:");
-    println!("  [1] Wii U");
-    println!("  [2] Switch");
-    println!("  [3] Load a .bnp file");
-    println!("  [4] Info");
-    let plat_choice = prompt("\nSelect 1, 2, 3 or 4 (default = 1): ");
+    let plat_choice = loop {
+        println!("Choose your platform:");
+        println!("  [1] Wii U");
+        println!("  [2] Switch");
+        println!("  [3] Load a .bnp file");
+        println!("  [4] Info");
+        let c = prompt("\nSelect 1, 2, 3 or 4: ");
+        match c.as_str() {
+            "1" | "2" | "3" | "4" => break c,
+            _ => eprintln!("Invalid choice — enter 1, 2, 3, or 4.\n"),
+        }
+    };
 
     // Option 4: show info.
     if plat_choice == "4" {
         println!();
         println!("╔════════════════════════════════════════════════╗");
-        println!("║                  ukmmsg2json                   ║");
+        println!("║               ukmm-extractool                  ║");
         println!("╠════════════════════════════════════════════════╣");
-        println!("║  Extracts UKMM Message/*.sarc files to         ║");
-        println!("║  .yaml, Actor/*.byml to .sbyml, and back,      ║");
-        println!("║  for both Wii U and Switch.                    ║");
+        println!("║  Extract and rebuild UKMM mod files:           ║");
         println!("║                                                ║");
-        println!("║  Supports their BCML .bnp counterpart the      ║");
-        println!("║  same way (logs/actorinfo.yml. & texts.json)   ║");
+        println!("║  • Message/*.product.sarc → structured .yaml   ║");
+        println!("║    (Msyt entries, editable, round-trip)        ║");
         println!("║                                                ║");
-        println!("║  ActorInfo .sbyml files should be edited       ║");
-        println!("║  with TotkBits:                                ║");
-        println!("║  https://github.com/SolidLink95/TotkBits       ║");
+        println!("║  • Actor/*.byml (mergeable CBOR) → .sbyml      ║");
+        println!("║    (native BYML, edit with TotkBits)           ║");
+        println!("║                                                ║");
+        println!("║  • Actor/ActorInfo.product.byml → .sbyml       ║");
+        println!("║    (CBOR ActorInfo ↔ Actors/Hashes BYML)       ║");
+        println!("║                                                ║");
+        println!("║  • Other .byml files handled as GenericByml    ║");
+        println!("║    or fallback YAML for non-roead formats.     ║");
+        println!("║                                                ║");
+        println!("║  • BCML .bnp archives: texts.json +            ║");
+        println!("║    actorinfo.yml extraction & rebuild.         ║");
         println!("║                                                ║");
         println!("║  Supported formats:                            ║");
-        println!("║    - .byml / .sbyml                            ║");
-        println!("║    - UKMM's .sarc                              ║");
-        println!("║    - .yml                                      ║");
-        println!("║    - .json                                     ║");
+        println!("║    - .byml / .sbyml (native Nintendo BYML)     ║");
+        println!("║    - UKMM .sarc / CBOR mergeable archives      ║");
+        println!("║    - .yaml / .yml (editable workspace)         ║");
+        println!("║    - BCML .bnp (7z)                            ║");
         println!("╚════════════════════════════════════════════════╝");
         println!();
         prompt("Press Enter to continue... ");
@@ -1057,7 +1085,8 @@ fn run_interactive() -> Result<()> {
     mods.sort_by_key(|a| a.display_name.to_lowercase());
 
     if mods.is_empty() {
-        anyhow::bail!("No mods found in {}.", mods_dir.display());
+        eprintln!("No mods found in {}.", mods_dir.display());
+        anyhow::bail!("Return to menu.");
     }
 
     // ── Mod selection ─────────────────────────────────────────────────────
@@ -1070,7 +1099,7 @@ fn run_interactive() -> Result<()> {
     let selection = prompt(&format!("\nSelect a mod to process (1-{}), or press Enter to cancel: ", mods.len()));
     if selection.is_empty() {
         println!("Cancelled.\n");
-        return Ok(());
+        anyhow::bail!("Return to menu.");
     }
     let index: usize = match selection.parse::<usize>() {
         Ok(n) if n >= 1 && n <= mods.len() => n - 1,
@@ -1090,12 +1119,16 @@ fn run_interactive() -> Result<()> {
     let has_existing = mods_out_dir.join(format!("{mod_name}_backup.zip")).is_file()
         && has_json_or_sbyml_recursive(&mods_out_dir);
     let action = if has_existing {
-        let a = prompt("\nA workspace has been found. What to do with it?\n[1] Rebuild (send edited files to UKMM)\n[2] Extract again (UKMM > mod files)\n[3] Restore original (from backup)\n\n(default = 1): ");
-        match a.trim() {
-            "2" => "extract",
-            "3" => "restore",
-            _ => "rebuild",
-        }
+        let a = loop {
+            let c = prompt("\nA workspace has been found. What to do with it?\n[1] Rebuild (send edited files to UKMM)\n[2] Extract again (UKMM > mod files)\n[3] Restore original (from backup)\n\nSelect 1, 2, or 3: ");
+            match c.trim() {
+                "1" => break "rebuild",
+                "2" => break "extract",
+                "3" => break "restore",
+                _ => eprintln!("Invalid choice — enter 1, 2, or 3.\n"),
+            }
+        };
+        a
     } else {
         "extract"
     };
@@ -1109,7 +1142,7 @@ fn run_interactive() -> Result<()> {
     }
 
     // ── Extract/copy mod to temp directory ────────────────────────────────
-    let temp_base = std::env::temp_dir().join("ukmmsg2json");
+    let temp_base = std::env::temp_dir().join("ukmm-extractool");
     let extract_dir = temp_base.join(&mod_name);
     if extract_dir.exists() {
         fs::remove_dir_all(&extract_dir)?;
@@ -1258,6 +1291,7 @@ fn run_interactive() -> Result<()> {
     println!("  Output:       {}", mods_out_dir.display());
     println!("  Backup:       {backup_name}");
     println!("\nDone!\n");
+    open_explorer(&mods_out_dir);
 
     Ok(())
 }
@@ -1469,6 +1503,7 @@ fn run_rebuild(mod_name: &str, mods_out_dir: &Path, _mod_dir_arg: &str, mod_path
     }
 
     println!("\nDone!\n");
+    open_explorer(mods_out_dir);
 
     Ok(())
 }
@@ -2587,7 +2622,7 @@ fn convert_file(path: &str) -> Result<Output> {
 /// 5. Save a backup of the .bnp
 /// 6. If a workspace already exists, offer rebuild / extract-again / restore
 fn handle_bnp_interactive() -> Result<()> {
-    let bnp_path = prompt("Drag & drop or enter path to .bnp file: ");
+    let bnp_path = prompt("Drag & drop or enter path to .bnp or .7z file: ");
     handle_bnp_interactive_for(bnp_path.trim_matches('"'))
 }
 
@@ -2598,8 +2633,8 @@ fn handle_bnp_interactive_for(bnp_path: &str) -> Result<()> {
         anyhow::bail!("File not found: {}", path.display());
     }
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if ext != "bnp" {
-        anyhow::bail!("Expected a .bnp file, got .{ext}");
+    if ext != "bnp" && ext != "7z" {
+        anyhow::bail!("Expected a .bnp or .7z file, got .{ext}");
     }
 
     let raw = fs::read(bnp_path)?;
@@ -2626,12 +2661,16 @@ fn handle_bnp_interactive_for(bnp_path: &str) -> Result<()> {
         && logs_dir.join("texts.json").is_file();
 
     let action = if workspace_exists {
-        let a = prompt("\nA workspace exists for this mod. What to do with it?\n[1] Send edited files into BNP\n[2] Extract again (BNP > YAML)\n[3] Restore original (from backup)\n\n(default = 1): ");
-        match a.trim() {
-            "2" => "extract",
-            "3" => "restore",
-            _ => "rebuild",
-        }
+        let a = loop {
+            let c = prompt("\nA workspace exists for this mod. What to do with it?\n[1] Send edited files into BNP\n[2] Extract again (BNP > YAML)\n[3] Restore original (from backup)\n\nSelect 1, 2, or 3: ");
+            match c.trim() {
+                "1" => break "rebuild",
+                "2" => break "extract",
+                "3" => break "restore",
+                _ => eprintln!("Invalid choice — enter 1, 2, or 3.\n"),
+            }
+        };
+        a
     } else {
         "extract"
     };
@@ -2723,7 +2762,7 @@ fn run_bnp_rebuild(mod_name: &str, mods_out_dir: &Path, _orig_bnp_path: &str, ba
     };
 
     // ── Extract backup to temp dir, replace texts.json, re-compress ───────
-    let temp_dir = std::env::temp_dir().join("ukmmsg2json_bnp_rebuild");
+    let temp_dir = std::env::temp_dir().join("ukmm-extractool_bnp_rebuild");
     if temp_dir.exists() {
         fs::remove_dir_all(&temp_dir)?;
     }
@@ -2782,9 +2821,34 @@ fn sanitize_filename(s: &str) -> String {
 
 /// Open Windows Explorer at the given directory.
 fn open_explorer(path: &Path) {
-    let _ = std::process::Command::new("explorer")
-        .arg(path)
-        .spawn();
+    // Explorer.exe on Windows needs absolute paths with backslashes.
+    // Canonicalize the path to get an absolute, normalized form.
+    let abs = path.canonicalize().unwrap_or_else(|_| {
+        // If canonicalization fails (path doesn't exist yet), try parent.
+        path.parent()
+            .and_then(|p| p.canonicalize().ok())
+            .unwrap_or_else(|| {
+                // Last resort: use the path as-is.
+                if path.is_absolute() { path.to_path_buf() }
+                else {
+                    // Prepend CWD for relative paths.
+                    let mut cwd = std::env::current_dir().unwrap_or_default();
+                    cwd.push(path);
+                    cwd
+                }
+            })
+    });
+
+    if abs.is_dir() {
+        let _ = std::process::Command::new("explorer")
+            .arg(abs.as_os_str())
+            .spawn();
+    } else if abs.exists() {
+        let arg = format!("/select,{}", abs.display());
+        let _ = std::process::Command::new("explorer")
+            .arg(&arg)
+            .spawn();
+    }
 }
 
 /// Recursively copy a directory tree.
