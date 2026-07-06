@@ -106,16 +106,35 @@ struct Output {
 ///
 /// Falls back to dictionary-less zstd if the dictionary-based decompressor
 /// can't be constructed or the decompression itself fails.
+/// Try to decompress a zstd-compressed buffer using the custom UKMM dictionary.
+///
+/// Falls back to dictionary-less zstd if the dictionary-based decompressor
+/// can't be constructed or the decompression itself fails.
+///
+/// # Resource limits
+///
+/// Decompression buffer is capped at 512 MiB to prevent CWE-400
+/// (uncontrolled resource consumption) from malicious inputs.
+const ZSTD_MAX_DECOMPRESS_SIZE: usize = 512 * 1024 * 1024;
+
 fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>> {
     // Attempt dictionary-based decompression first (UKMM's preferred format).
     if let Ok(mut d) = zstd::bulk::Decompressor::with_dictionary(ZSTD_DICTIONARY) {
-        // upper_bound() may error for some compressed data — fall back to a generous estimate.
+        // upper_bound() may error for compressed data — cap buffer size.
         let size = zstd::bulk::Decompressor::upper_bound(data)
-            .unwrap_or(data.len().saturating_mul(1024));
+            .unwrap_or(data.len().saturating_mul(1024))
+            .min(ZSTD_MAX_DECOMPRESS_SIZE);
         if let Ok(out) = d.decompress(data, size) { return Ok(out); }
     }
     eprintln!("Warning: custom dictionary decompression failed, falling back to dictionary-less zstd");
-    zstd::decode_all(data).context("zstd decompress failed")
+    // Streaming decoder with explicit size cap.
+    let mut out = Vec::with_capacity(data.len().min(ZSTD_MAX_DECOMPRESS_SIZE));
+    let mut decoder = zstd::Decoder::new(data)?;
+    decoder.read_to_end(&mut out)?;
+    if out.len() > ZSTD_MAX_DECOMPRESS_SIZE {
+        anyhow::bail!("zstd decompressed output exceeds {ZSTD_MAX_DECOMPRESS_SIZE} bytes — possible bomb");
+    }
+    Ok(out)
 }
 
 /// Compress data with zstd, preferring the custom UKMM dictionary at compression level 8.
@@ -391,7 +410,8 @@ fn extract_cbor_strings(data: &[u8]) -> Vec<String> {
     /// Maximum string length to process (100 MiB). Anything larger is skipped.
     const MAX_STRING_LEN: usize = 100 * 1024 * 1024;
 
-    let mut strings = Vec::new();
+    // Pre-allocate: typical CBOR blobs have a few dozen strings at most.
+    let mut strings = Vec::with_capacity(128);
     let mut i = 0;
     while i < data.len() {
         let b = data[i];
@@ -605,26 +625,33 @@ fn parse_cbor(data: &[u8]) -> Result<Output> {
     for (i, blob) in json_blobs.iter().enumerate() {
         let name = names.get(i).cloned().unwrap_or_else(|| format!("section_{i}"));
 
-        let val: serde_json::Value = match serde_json::from_str(blob) {
-            Ok(v) => v,
+        // Deserialize the Msyt envelope: {"group_count":N,"entries":{...}}
+        // Extract "entries" directly from the JSON string to avoid a clone.
+        let entries_val: serde_json::Value = match serde_json::from_str(blob) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                map.remove("entries")
+                    .ok_or_else(|| anyhow::anyhow!("missing 'entries' key"))
+            }
+            Ok(_) => {
+                eprintln!("Warning: skipping JSON blob at index {i} — not an object");
+                continue;
+            }
             Err(e) => {
                 eprintln!("Warning: skipping invalid JSON at index {i}: {e}");
                 continue;
             }
-        };
-
-        let Some(entries_val) = val.get("entries") else {
+        }.unwrap_or_else(|_| {
             eprintln!("Warning: skipping JSON blob at index {i} — missing 'entries' key");
-            continue;
-        };
+            serde_json::Value::Null
+        });
 
-        if !entries_val.is_object() {
+        if entries_val.is_null() || !entries_val.is_object() {
             eprintln!("Warning: skipping JSON blob at index {i} — 'entries' is not an object");
             continue;
         }
 
         // Deserialize as IndexMap<String, Entry> for message data
-        match serde_json::from_value::<IndexMap<String, Entry>>(entries_val.clone()) {
+        match serde_json::from_value::<IndexMap<String, Entry>>(entries_val) {
             Ok(im) => {
                 if im.is_empty() {
                     eprintln!("Warning: section '{name}' has zero entries after deserialization");
@@ -658,14 +685,82 @@ fn write_output(out: &Output, path: &Path) -> Result<()> {
     let mut val = serde_json::to_value(out)?;
 
     // Strip fields that are redundant or cause validation issues.
+    // At rebuild time, the format is auto-detected from the entries structure.
     if let Some(obj) = val.as_object_mut() {
         obj.remove("language");
         obj.remove("entry_count");
+        obj.remove("format");
     }
     let yaml = serde_yaml::to_string(&val)?;
     fs::write(path, &yaml)?;
     eprintln!("  ✓ Wrote {} entries to {}", out.entries.len(), path.display());
     Ok(())
+}
+
+/// Detect the source format from the entries structure alone.
+///
+/// This is used at rebuild time when the YAML has no `format:` field
+/// (stripped by [`write_output`] for cleaner output).
+///
+/// Rules:
+/// - **Mergeable**: the single entry value is an object whose first key is
+///   `"Mergeable"` — e.g. `{ "Mergeable": { "GenericByml": { ... } } }`.
+/// - **ActorInfo**: every key in the entry value looks like a decimal u32 hash
+///   (at least 1 entry matches) and the value is a 2-element array
+///   `[ { "Map": {...} }, bool ]`.
+/// - **BYML**: the entry value contains a `"__byml__"` key (legacy wrapper).
+/// - **default** (message): standard Msyt entries with `"contents"` arrays.
+fn detect_format(entries: &BTreeMap<String, serde_json::Value>) -> Option<&'static str> {
+    // Empty → can't determine.
+    if entries.is_empty() {
+        return None;
+    }
+
+    // Count how many entries look like each format.
+    let mut mergeable = 0usize;
+    let mut actorinfo = 0usize;
+    let mut byml = 0usize;
+    let mut message = 0usize;
+
+    for val in entries.values() {
+        match val {
+            // Mergeable: `{ "Mergeable": { ... } }` — top-level key is "Mergeable"
+            serde_json::Value::Object(map) if map.contains_key("Mergeable") => {
+                mergeable += 1;
+            }
+            // BYML: contains "__byml__" key
+            serde_json::Value::Object(map) if map.contains_key("__byml__") => {
+                byml += 1;
+            }
+            // ActorInfo: at least one key is a decimal u32, value is [obj, bool]
+            serde_json::Value::Object(map) => {
+                let has_hash = map.keys().any(|k| k.parse::<u32>().is_ok());
+                let is_actor = has_hash
+                    && map.values().any(|v| {
+                        v.as_array()
+                            .map(|a| a.len() == 2 && a[0].is_object() && (a[1].is_boolean() || a[1].is_null()))
+                            .unwrap_or(false)
+                    });
+                if is_actor {
+                    actorinfo += 1;
+                } else {
+                    message += 1;
+                }
+            }
+            // Arrays or scalars → assume message context
+            _ => message += 1,
+        }
+    }
+
+    // Pick the format with the most votes (deterministic tie-breaking).
+    let max = mergeable.max(actorinfo).max(byml).max(message);
+    if max == 0 {
+        return None;
+    }
+    if mergeable == max { Some("Mergeable") }
+    else if actorinfo == max { Some("ActorInfo") }
+    else if byml == max { Some("BYML") }
+    else { None }  // message entries need no format hint
 }
 
 fn main() -> Result<()> {
@@ -887,7 +982,7 @@ fn run_interactive() -> Result<()> {
     if plat_choice == "4" {
         println!();
         println!("╔════════════════════════════════════════════════╗");
-        println!("║              ukmmsg2json v{}", env!("CARGO_PKG_NAME"));
+        println!("║                  ukmmsg2json                   ║");
         println!("╠════════════════════════════════════════════════╣");
         println!("║  Extracts UKMM Message/*.sarc files to         ║");
         println!("║  .yaml, Actor/*.byml to .sbyml, and back,      ║");
@@ -1061,12 +1156,78 @@ fn run_interactive() -> Result<()> {
         let parent_dir = mods_out_dir.join(relative).parent().unwrap_or(&mods_out_dir).to_path_buf();
         fs::create_dir_all(&parent_dir)?;
 
-        // ActorInfo → .sbyml natif, autres BYML → .yaml
+        // Mergeable → .sbyml (roead format) or .yaml (fallback)
+        if out.format.as_deref() == Some("Mergeable") {
+            if let Some(b64) = out.entries.get("_sbyml_bytes").and_then(|v| v.as_str()) {
+                let sbyml_bytes = base64_decode(b64)?;
+                let mut sbyml_name = mods_out_dir.join(relative);
+                sbyml_name.set_extension("sbyml");
+                if let Some(parent) = sbyml_name.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&sbyml_name, &sbyml_bytes)?;
+                eprintln!("  ✓ Converted to native BYML: {}", sbyml_name.display());
+            } else {
+                // Not in roead serde format — write as YAML.
+                let output_path = mods_out_dir.join(relative).with_extension("yaml");
+                write_output(&out, &output_path)?;
+            }
+            continue;
+        }
+
+        // ActorInfo → .sbyml natif
         if out.format.as_deref() == Some("ActorInfo") {
             let compressed = actorinfo_output_to_sbyml(&out)?;
             let mut sbyml_name = mods_out_dir.join(relative);
             sbyml_name.set_extension("sbyml");
             fs::write(&sbyml_name, &compressed)?;
+            eprintln!("  ✓ Converted to native BYML: {}", sbyml_name.display());
+            continue;
+        }
+
+        // Autres BYML simples → .sbyml natif
+        let compressed = {
+            use roead::byml::Byml;
+            let val = serde_json::to_value(&out)?;
+            // entries has one key = stem, value = { "__byml__": { "attributes": json_str } }
+            // We need to extract the actual BYML value and convert it.
+            if let Some(entries_map) = val.get("entries").and_then(|v| v.as_object()) {
+                let mut found = false;
+                let mut result = None;
+                for entries_val in entries_map.values() {
+                    if let Some(section) = entries_val.as_object() {
+                        if let Some(entry) = section.get("__byml__") {
+                            if let Some(json_text) = entry.get("attributes").and_then(|a| a.as_str()) {
+                                let val: serde_json::Value =
+                                    serde_json::from_str(json_text)?;
+                                let byml: Byml = serde_json::from_value(val)?;
+                                let binary = byml.to_binary(roead::Endian::Big);
+                                result = Some(roead::yaz0::compress(&binary));
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if found {
+                    result
+                } else {
+                    // Fallback: just convert via value_to_byml
+                    let byml: Byml = serde_json::from_value(
+                        serde_json::to_value(&out.entries)?
+                    )?;
+                    let binary = byml.to_binary(roead::Endian::Big);
+                    Some(roead::yaz0::compress(&binary))
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(sbyml_bytes) = compressed {
+            let mut sbyml_name = mods_out_dir.join(relative);
+            sbyml_name.set_extension("sbyml");
+            fs::write(&sbyml_name, &sbyml_bytes)?;
             eprintln!("  ✓ Converted to native BYML: {}", sbyml_name.display());
         } else {
             let output_path = mods_out_dir.join(relative).with_extension("yaml");
@@ -1117,11 +1278,25 @@ fn run_rebuild(mod_name: &str, mods_out_dir: &Path, _mod_dir_arg: &str, mod_path
     println!("\n── Rebuilding modified ZIP from edited files ──\n");
 
     // ── Collect edited files recursively from the output directory ────────
-    let edited_files: Vec<PathBuf> = {
+    let mut edited_files: Vec<PathBuf> = {
         let mut files = Vec::new();
         collect_edited_files(mods_out_dir, &mut files);
         files
     };
+
+    // Dedup: if both `.sbyml` and `.yaml` exist for the same stem,
+    // keep only the `.sbyml` (it's the canonical edited format).
+    edited_files.sort_by(|a, b| {
+        let a_stem = a.file_stem().and_then(OsStr::to_str).unwrap_or("");
+        let b_stem = b.file_stem().and_then(OsStr::to_str).unwrap_or("");
+        let a_is_sbyml = a.extension().is_some_and(|x| x == "sbyml");
+        let b_is_sbyml = b.extension().is_some_and(|x| x == "sbyml");
+        // Sort sbyml before yaml for the same stem, then by path.
+        a_stem.cmp(b_stem).then_with(|| b_is_sbyml.cmp(&a_is_sbyml))
+    });
+    edited_files.dedup_by(|a, b| {
+        a.file_stem() == b.file_stem()
+    });
 
     if edited_files.is_empty() {
         anyhow::bail!("No edited files found in {}.", mods_out_dir.display());
@@ -1132,16 +1307,40 @@ fn run_rebuild(mod_name: &str, mods_out_dir: &Path, _mod_dir_arg: &str, mod_path
     for file_path in &edited_files {
         let stem = file_path.file_stem().and_then(OsStr::to_str).unwrap_or("unknown");
 
-        // ── .sbyml (native BYML ActorInfo) ───────────────────────────────
+        // ── .sbyml (native BYML) ────────────────────────────────────────
         if file_path.extension().is_some_and(|x| x == "sbyml") {
             let raw = fs::read(file_path)?;
             let data = decompress(&raw)?;
-            let out = parse_byml_actorinfo(&data, &file_path.to_string_lossy())?;
-            let raw_cbor = rebuild_actorinfo_from_output(&out)?;
-            let compressed = zstd_compress(&raw_cbor)?;
-            let byml_name = format!("{stem}.byml");
-            println!("  Converting (ActorInfo): {} → {byml_name}", file_path.file_name().unwrap_or_default().to_string_lossy());
-            converted.push((byml_name, compressed, true));
+
+                    // Check if this is a mergeable .sbyml (not ActorInfo BYML).
+            // Mergeable BYML has a single Map key with serde-tagged values;
+            // ActorInfo BYML has "Actors" and "Hashes" arrays.
+            let is_mergeable = match roead::byml::Byml::from_binary(&data) {
+                Ok(byml) => {
+                    if let Ok(map) = byml.as_map() {
+                        // If it has Actors/Hashes arrays, it's ActorInfo BYML.
+                        let has_actors = map.contains_key("Actors");
+                        let has_hashes = map.contains_key("Hashes");
+                        !has_actors && !has_hashes
+                    } else { true }
+                }
+                Err(_) => false,
+            };
+
+            if is_mergeable {
+                let cbor_bytes = sbyml_to_mergeable_cbor(&data, stem)?;
+                let byml_name = format!("{stem}.byml");
+                println!("  Converting (Mergeable): {} → {byml_name}", file_path.file_name().unwrap_or_default().to_string_lossy());
+                converted.push((byml_name, cbor_bytes, true));
+            } else {
+                // Native ActorInfo BYML (Actors/Hashes format).
+                let out = parse_byml_actorinfo(&data, &file_path.to_string_lossy())?;
+                let raw_cbor = rebuild_actorinfo_from_output(&out)?;
+                let compressed = zstd_compress(&raw_cbor)?;
+                let byml_name = format!("{stem}.byml");
+                println!("  Converting (ActorInfo): {} → {byml_name}", file_path.file_name().unwrap_or_default().to_string_lossy());
+                converted.push((byml_name, compressed, true));
+            }
             continue;
         }
 
@@ -1149,14 +1348,24 @@ fn run_rebuild(mod_name: &str, mods_out_dir: &Path, _mod_dir_arg: &str, mod_path
         let yaml_text = fs::read_to_string(file_path)?;
         let val: serde_json::Value = serde_yaml::from_str(&yaml_text)
             .with_context(|| format!("Failed to parse {}.", file_path.display()))?;
-        let out: Output = serde_json::from_value(val)
+        let mut out: Output = serde_json::from_value(val)
             .with_context(|| format!("Failed to convert YAML {} to Output.", file_path.display()))?;
+
+        // Auto-detect format from entries structure when stripped from YAML.
+        if out.format.is_none() {
+            out.format = detect_format(&out.entries).map(String::from);
+        }
 
         if out.format.as_deref() == Some("BYML") {
             let byml_bytes = rebuild_byml_from_output(&out)?;
             let byml_name = format!("{stem}.byml");
             println!("  Converting: {} → {byml_name}", file_path.file_name().unwrap_or_default().to_string_lossy());
             converted.push((byml_name, byml_bytes, true));
+        } else if out.format.as_deref() == Some("Mergeable") {
+            let cbor_bytes = rebuild_mergeable_from_output(&out)?;
+            let byml_name = format!("{stem}.byml");
+            println!("  Converting (Mergeable): {} → {byml_name}", file_path.file_name().unwrap_or_default().to_string_lossy());
+            converted.push((byml_name, cbor_bytes, true));
         } else if out.format.as_deref() == Some("ActorInfo") {
             let raw_bytes = rebuild_actorinfo_from_output(&out)?;
             let compressed = zstd_compress(&raw_bytes)?;
@@ -1613,8 +1822,6 @@ fn rebuild_byml_from_output(out: &Output) -> Result<Vec<u8>> {
 /// This takes the CBOR Mergeable ActorInfo format and produces native BYML
 /// with `Actors` (array of actor BYML maps) and `Hashes` (array of u32).
 /// The result is yaz0-compressed and ready to write as `.sbyml`.
-///
-/// The reverse function is `actorinfo_byml_to_output()`.
 fn actorinfo_output_to_sbyml(out: &Output) -> Result<Vec<u8>> {
     use roead::byml::Byml;
 
@@ -1690,69 +1897,21 @@ fn actorinfo_output_to_sbyml(out: &Output) -> Result<Vec<u8>> {
     Ok(compressed)
 }
 
-/// Parse standard Nintendo BYML ActorInfo (with `Actors`/`Hashes`) and produce
-/// the same unfolded Output format as `parse_actorinfo_cbor()`.
-///
-/// The reverse function is `actorinfo_output_to_sbyml()`.
-#[allow(dead_code)]
-fn actorinfo_byml_to_output(data: &[u8], path: &str) -> Result<Output> {
-    use roead::byml::Byml;
-
-    let byml = Byml::from_binary(data).context("Failed to parse ActorInfo BYML")?;
-    let map = byml.as_map().map_err(|_| anyhow::anyhow!("ActorInfo BYML root is not a map"))?;
-
-    let actors = map.get("Actors")
-        .and_then(|v| v.as_array().ok())
-        .context("ActorInfo BYML missing 'Actors' array")?;
-
-    let stem = filename_stem(Path::new(path));
-    let mut actor_map = serde_json::Map::new();
-
-    for actor_byml in actors {
-        let actor_roead_map = actor_byml.as_map()
-            .map_err(|_| anyhow::anyhow!("Actor entry is not a map"))?;
-
-        // In native BYML, the name is a plain string, not wrapped in { "String": "..." }
-        let name = actor_roead_map.get("name")
-            .and_then(|v| v.as_string().ok())
-            .context("Actor entry missing 'name' string")
-            .map(|s| s.to_string())?;
-
-        let hash = roead::aamp::hash_name(&name);
-
-        // Serialize the actor BYML directly as JSON value.
-        // In roead's JSON format, a BYML string is { "String": "..." },
-        // a map is { "Map": { ... } }, etc.
-        // But the actor data from `serde_json::to_value(&byml)` uses roead's
-        // internal serde representation which already wraps types correctly:
-        // { "name": { "String": "Weapon_Sword_026" }, "attackPower": { "I32": 80 }, ... }
-        let actor_json = serde_json::to_value(actor_byml)
-            .context("Failed to serialize actor BYML to JSON")?;
-
-        let mut wrapped = serde_json::Map::new();
-        wrapped.insert("Map".into(), actor_json);
-        let entry = serde_json::Value::Array(vec![
-            serde_json::Value::Object(wrapped),
-            serde_json::Value::Bool(false),
-        ]);
-
-        actor_map.insert(hash.to_string(), entry);
-    }
-
-    let mut entries: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-    entries.insert(stem, serde_json::Value::Object(actor_map));
-
-    Ok(Output {
-        language: None,
-        entry_count: None,
-        entries,
-        format: Some("ActorInfo".into()),
-    })
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // ActorInfo CBOR (Mergeable / ActorInfo) support
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Heuristic: does the byte buffer look like a UKMM "Mergeable" CBOR?
+///
+/// Checks the first ~11 bytes for the structure:
+/// `map(1){ "Mergeable": map(1){ ... } }`
+fn looks_like_mergeable_cbor(d: &[u8]) -> bool {
+    d.len() > 13
+        && d[0] == 0xA1                                          // map(1)
+        && d[1] == 0x69                                          // text(9)
+        && &d[2..11] == b"Mergeable"
+        && d[11] == 0xA1                                         // inner map(1)
+}
 
 /// Heuristic: does the byte buffer look like a UKMM "Mergeable" / "ActorInfo" CBOR?
 ///
@@ -1766,6 +1925,20 @@ fn looks_like_actorinfo_cbor(d: &[u8]) -> bool {
         && d[11] == 0xA1                                         // map(1)
         && d[12] == 0x69                                         // text(9)
         && &d[13..22] == b"ActorInfo"
+}
+
+/// Heuristic: does the byte buffer look like a UKMM Mergeable / MessagePack CBOR?
+///
+/// Checks the first ~24 bytes for the structure:
+/// `map(1){ "Mergeable": map(1){ "MessagePack": ... } }`
+fn looks_like_messagepack_cbor(d: &[u8]) -> bool {
+    d.len() > 24
+        && d[0] == 0xA1                                          // map(1)
+        && d[1] == 0x69                                          // text(9)
+        && &d[2..11] == b"Mergeable"
+        && d[11] == 0xA1                                         // inner map(1)
+        && d[12] == 0x6B                                         // text(11)
+        && &d[13..24] == b"MessagePack"
 }
 
 /// Recursively decode a CBOR byte buffer into a `serde_json::Value`.
@@ -1918,6 +2091,43 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+/// Minimal base64 decode (RFC 4648).
+fn base64_decode(input: &str) -> Result<Vec<u8>> {
+    fn decode_char(c: u8) -> Result<u8> {
+        match c {
+            b'A'..=b'Z' => Ok(c - b'A'),
+            b'a'..=b'z' => Ok(c - b'a' + 26),
+            b'0'..=b'9' => Ok(c - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            b'=' => Ok(0),
+            _ => anyhow::bail!("Invalid base64 character: {c:#02x}"),
+        }
+    }
+
+    let input = input.trim_end_matches('=');
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let bytes = input.as_bytes();
+    for chunk in bytes.chunks(4) {
+        let mut buf = [0u8; 4];
+        for (i, &b) in chunk.iter().enumerate() {
+            buf[i] = decode_char(b)?;
+        }
+        let triple = ((buf[0] as u32) << 18)
+            | ((buf[1] as u32) << 12)
+            | ((buf[2] as u32) << 6)
+            | (buf[3] as u32);
+        out.push((triple >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((triple >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(triple as u8);
+        }
+    }
+    Ok(out)
+}
+
 /// Recursively encode a `serde_json::Value` as CBOR bytes.
 fn json_to_cbor(val: &serde_json::Value, buf: &mut Vec<u8>) {
     match val {
@@ -2053,6 +2263,56 @@ fn rebuild_actorinfo_from_output(out: &Output) -> Result<Vec<u8>> {
     anyhow::bail!("No ActorInfo data found in output");
 }
 
+/// Convert native BYML `.sbyml` back to zstd-compressed CBOR for injection
+/// into the UKMM archive. The DataType (e.g. "GenericByml", "EventInfo") is
+/// derived from the filename stem.
+///
+/// Inverse of [`parse_mergeable_cbor`].
+fn sbyml_to_mergeable_cbor(byml_data: &[u8], default_type: &str) -> Result<Vec<u8>> {
+    use roead::byml::Byml;
+
+    let byml = Byml::from_binary(byml_data)
+        .context("Failed to parse mergeable BYML")?;
+    let val: serde_json::Value = serde_json::to_value(&byml)
+        .context("Failed to serialize mergeable BYML to JSON")?;
+
+    // Re-wrap: { "Mergeable": { "<DataType>": { ... } } }
+    // DataType derived from the filename stem (e.g. EffectInfo, EventInfo.product).
+    let outer = serde_json::json!({
+        "Mergeable": {
+            default_type: val
+        }
+    });
+
+    let mut buf = Vec::with_capacity(65536);
+    json_to_cbor(&outer, &mut buf);
+    zstd_compress(&buf)
+}
+
+/// Rebuild a generic Mergeable CBOR binary from an edited file.
+///
+/// Two cases:
+/// - `.sbyml` files are rebuilt via [`sbyml_to_mergeable_cbor`] (handled in the
+///   `.sbyml` block of `run_rebuild`).
+/// - `.yaml` files contain raw JSON values decoded from CBOR (not in roead
+///   serde format) — encode them back to CBOR and zstd-compress.
+fn rebuild_mergeable_from_output(out: &Output) -> Result<Vec<u8>> {
+    for entries_val in out.entries.values() {
+        if !entries_val.is_null() {
+            // Skip the _sbyml_bytes sentinel if present (handled by sbyml path).
+            if entries_val.as_str().is_some()
+                && out.entries.contains_key("_sbyml_bytes")
+            {
+                continue;
+            }
+            let mut buf = Vec::with_capacity(65536);
+            json_to_cbor(entries_val, &mut buf);
+            return zstd_compress(&buf);
+        }
+    }
+    anyhow::bail!("No Mergeable data found in output");
+}
+
 /// Heuristic: does the decompressed BYML data look like native ActorInfo
 /// (i.e., contains "Actors" and "Hashes" arrays)?
 fn looks_like_actorinfo_byml(data: &[u8]) -> bool {
@@ -2068,6 +2328,92 @@ fn looks_like_actorinfo_byml(data: &[u8]) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Parse a generic UKMM Mergeable CBOR blob into an `Output`.
+///
+/// These have the structure:
+/// ```cbor
+/// { "Mergeable": "<DataType>": { ... actual data ... } }
+/// ```
+///
+/// The CBOR is decoded to a JSON value. The data payload is extracted and
+/// converted to native BYML (yaz0-compressed `.sbyml`), with the DataType
+/// For round-trip fidelity, the DataType is derived from the filename stem.
+///
+/// The `.sbyml` bytes are returned via `format = "Mergeable"` and a sentinel
+/// entry `"_sbyml_bytes"`, so the caller can write them directly.
+fn parse_mergeable_cbor(data: &[u8], _path: &str) -> Result<Output> {
+
+    let val = cbor_to_json(data, &mut 0)?;
+
+    // val = { "Mergeable": { "<DataType>": { ... data ... } } }
+    let inner = val.get("Mergeable")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.iter().next())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .context("Mergeable CBOR: expected { \"Mergeable\": { \"<DataType>\": ... } }")?;
+
+    let (_data_type, raw_payload) = inner;
+
+    // Check if the payload is in roead's with-serde format (a single-key object
+    // where the key is "Map", "Array", "String", "Bool", "F32", "F64", "I32",
+    // "U32"). If not, fall back to YAML output (the payload isn't representable
+    // as native BYML).
+    let is_roead_format = matches!(&raw_payload,
+        serde_json::Value::Object(m) if m.len() == 1 &&
+            m.contains_key("Map") || m.contains_key("Array") ||
+            m.contains_key("String") || m.contains_key("Bool") ||
+            m.contains_key("F32") || m.contains_key("F64") ||
+            m.contains_key("I32") || m.contains_key("U32")
+    );
+
+    if !is_roead_format {
+        // Not roead format — store as raw JSON in entries for YAML output.
+        let stem = filename_stem(Path::new(_path));
+        let mut entries: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        entries.insert(stem, val);
+        return Ok(Output {
+            language: None,
+            entry_count: None,
+            entries,
+            format: Some("Mergeable".into()),
+        });
+    }
+
+    // CBOR supports null but BYML doesn't. Replace null → false.
+    fn replace_null(val: &mut serde_json::Value) {
+        match val {
+            serde_json::Value::Null => *val = serde_json::Value::Bool(false),
+            serde_json::Value::Object(m) => m.values_mut().for_each(replace_null),
+            serde_json::Value::Array(a) => a.iter_mut().for_each(replace_null),
+            _ => {}
+        }
+    }
+    let mut payload = raw_payload;
+    replace_null(&mut payload);
+
+
+
+    // Convert payload to native BYML bytes and yaz0-compress.
+    let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+    let byml: roead::byml::Byml = serde_json::from_value(payload)
+        .with_context(|| {
+            format!("Failed to deserialize mergeable payload to BYML: {}...",
+                &payload_str[..payload_str.len().min(200)])
+        })?;
+    let binary = byml.to_binary(roead::Endian::Big);
+    let compressed = roead::yaz0::compress(&binary);
+
+    let mut entries: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    entries.insert("_sbyml_bytes".to_string(), serde_json::json!(base64_encode(&compressed)));
+
+    Ok(Output {
+        language: None,
+        entry_count: None,
+        entries,
+        format: Some("Mergeable".into()),
+    })
 }
 
 /// Parse a native BYML ActorInfo file (with "Actors" / "Hashes" arrays) into
@@ -2171,10 +2517,21 @@ fn convert_file(path: &str) -> Result<Output> {
         return parse_byml_file_output(&data, path);
     }
 
-    // ── UKMM Mergeable / ActorInfo CBOR detection ─────────────────────────
+    // ── UKMM Mergeable CBOR detection ────────────────────────────────────
     if looks_like_actorinfo_cbor(&data) {
         eprintln!("actorinfo...");
         return parse_actorinfo_cbor(&data, path);
+    }
+    // MessagePack must be checked BEFORE generic mergeable — it needs the
+    // old Msyt-deserializing path (parse_cbor) that extracts proper Entry
+    // structures from the JSON strings inside the CBOR, not raw JSON dumps.
+    if looks_like_messagepack_cbor(&data) {
+        eprintln!("messagepack...");
+        return parse_cbor(&data);
+    }
+    if looks_like_mergeable_cbor(&data) {
+        eprintln!("mergeable...");
+        return parse_mergeable_cbor(&data, path);
     }
 
     // Try SARC / CBOR, catching errors so BYML can be a last-resort fallback.
