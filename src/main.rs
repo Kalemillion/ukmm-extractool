@@ -393,7 +393,7 @@ fn decompress(raw: &[u8]) -> Result<Vec<u8>> {
         raw.to_vec()
     };
     // Check for yaz0 magic after zstd decompression
-    if d.len() > 4 && d[0..4] == [b'Y', b'a', b'z', b'0'] {
+    if d.len() > 4 && d[0..4] == *b"Yaz0" {
         eprintln!("yaz0...");
         Ok(roead::yaz0::decompress(&d)?)
     } else {
@@ -408,7 +408,7 @@ fn decompress(raw: &[u8]) -> Result<Vec<u8>> {
 /// Also requires at least 0x21 bytes to avoid false positives.
 fn is_sarc(d: &[u8]) -> bool {
     d.len() > 0x20
-        && (d[0..4] == [b'S', b'A', b'R', b'C'] || d[0x11..0x15] == [b'S', b'A', b'R', b'C'])
+        && (d[0..4] == *b"SARC" || d[0x11..0x15] == *b"SARC")
 }
 
 /// Heuristic: does the first byte look like a CBOR map header?
@@ -1373,7 +1373,7 @@ fn run_interactive() -> Result<()> {
 
     println!("\n  Selected: {}", chosen.display_name);
 
-    let mod_dir_arg = format!("{}/{}", platform, &mod_name);
+    let mod_dir_arg = format!("{}/{}", platform, mod_name);
     let mods_out_dir = PathBuf::from("mods").join(&mod_dir_arg);
 
     // Check for existing workspace (backup ZIP + any .json or .sbyml files recursively).
@@ -2515,7 +2515,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
             b'+' => Ok(62),
             b'/' => Ok(63),
             b'=' => Ok(0),
-            _ => anyhow::bail!("Invalid base64 character: {c:#02x}"),
+            _ => anyhow::bail!("Invalid base64 character: {c:#x}"),
         }
     }
 
@@ -2548,6 +2548,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
 /// valid base64 characters (A-Z, a-z, 0-9, +, /, =), length is a multiple of 4,
 /// and padding is correct. This is used to reconstruct CBOR byte strings
 /// from the JSON representation during round-trip.
+#[allow(dead_code)]
 fn looks_like_base64(s: &str) -> bool {
     if s.len() < 4 || !s.len().is_multiple_of(4) {
         return false;

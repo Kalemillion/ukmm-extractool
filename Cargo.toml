@@ -1,6 +1,6 @@
 [package]
 name = "ukmm-extractool"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Extract and rebuild UKMM mod files (.byml/.sarc) to/from editable YAML and native BYML"
 repository = "https://github.com/Kalemillion/ukmm-extractool"
