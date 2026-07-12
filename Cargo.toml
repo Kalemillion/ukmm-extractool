@@ -2,7 +2,7 @@
 name = "ukmm-extractool"
 version = "0.2.0"
 edition = "2021"
-description = "Extract and rebuild UKMM mod files (.byml/.sarc/.bnp) to/from editable YAML and native BYML"
+description = "Extract and rebuild UKMM mod files (.byml/.sarc) to/from editable YAML and native BYML"
 repository = "https://github.com/Kalemillion/ukmm-extractool"
 license = "MIT"
 
@@ -10,11 +10,10 @@ license = "MIT"
 anyhow = "1.0"
 indexmap = { version = "2.7", features = ["serde"] }
 msyt = { git = "https://github.com/NiceneNerd/msyt", rev = "12e4d95fb6480f445284f37706db7bfa8351dc06" }
-roead = { version = "1.0", features = ["with-serde"] }
+roead = { version = "1.0", features = ["with-serde", "yaml"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 zip = "2"
 zstd = { version = "0.13.3", features = ["experimental"] }
-sevenz-rust = "0.6"
 atty = "0.2"

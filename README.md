@@ -12,7 +12,6 @@ A CLI tool that handles every format found in [UKMM](https://github.com/NiceneNe
 | | `Actor/*.byml` (mergeable CBOR) → `.sbyml` (native Nintendo BYML) |
 | | `Actor/ActorInfo.product.byml` → `.sbyml` (Actors/Hashes arrays) |
 | | Other `.byml` files → `.sbyml` (if roead format) or `.yaml` fallback |
-| **BCML** `.bnp` | `logs/texts.json` + `logs/actorinfo.yml` → editable workspace |
 
 ---
 
@@ -46,15 +45,6 @@ ukmm-extractool.exe
 Edited `.sbyml` and `.yaml` files are converted back and injected into the ZIP.
 
 **Restore:** Pick **[3] Restore original (from backup)** to undo all edits.
-
-### BCML `.bnp` files
-
-1. Pick **3 — Load a .bnp file**
-2. Drag & drop or type the path to a `.bnp` file
-3. `logs/texts.json` and `logs/actorinfo.yml` are extracted
-4. Everything lands in `mods/<platform>/<mod_name>/`
-
-**Rebuilding:** Same mod → **[1] Send edited files into BNP**.
 
 ---
 

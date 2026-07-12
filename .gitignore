@@ -1,6 +1,5 @@
 # Runtime output + test fixtures
 mods/
-*.bnp
 logs_temp/
 
 # Created by https://www.toptal.com/developers/gitignore/api/rust,macos,visualstudiocode
