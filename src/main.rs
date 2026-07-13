@@ -13,7 +13,9 @@
 //! **Rebuild**:  JSON → build CBOR wire format → zstd compress → inject into new ZIP
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use indexmap::IndexMap;
+use mimalloc::MiMalloc;
 use msyt::{model::Entry, Msyt};
 use roead::sarc::Sarc;
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 /// Custom zstd dictionary embedded at compile time.
 ///
 /// This dictionary is critical for compatibility with UKMM's compression format.
@@ -35,6 +40,9 @@ static ZSTD_DICTIONARY: &[u8] = include_bytes!("../data/zsdic");
 /// First 2 bytes of a raw BYML file, big-endian ("BY") or little-endian ("YB").
 const BYML_MAGIC_BE: &[u8] = b"BY";
 const BYML_MAGIC_LE: &[u8] = b"YB";
+
+/// First 4 bytes of a zstd-compressed block (0x28, 0xB5, 0x2F, 0xFD).
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Section names to automatically strip from extracted message files.
 ///
@@ -133,6 +141,108 @@ struct Output {
     /// Omitted from JSON when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     format: Option<String>,
+}
+
+/// Direction of conversion: extract (file → YAML/BYML) or rebuild (YAML/BYML → file).
+#[derive(Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+enum Direction {
+    Extract,
+    Rebuild,
+}
+
+/// Extension to use for a given format in extract direction.
+fn extract_extension(out: &Output) -> &'static str {
+    match out.format.as_deref() {
+        Some("Mergeable" | "ActorInfo" | "BYML") => "sbyml",
+        Some("SarcMap" | "Binary") => "yaml",
+        Some("AAMP") => "yaml",
+        _ => "yaml",
+    }
+}
+
+/// Extension to use for a given format in rebuild direction.
+fn rebuild_extension(out: &Output) -> &'static str {
+    match out.format.as_deref() {
+        Some("BYML" | "Mergeable" | "ActorInfo") => "byml",
+        Some("SarcMap") => "srsarc",
+        Some("Binary") => "bin",
+        _ => "sarc",
+    }
+}
+
+/// Dispatch extract: convert parsed Output into filesystem bytes.
+/// Returns (bytes, was_handled) — if not handled, caller writes YAML fallback.
+fn dispatch_extract(out: &Output) -> Result<Option<Vec<u8>>> {
+    match out.format.as_deref() {
+        Some("Mergeable") => {
+            if let Some(b64) = out.entries.values().find_map(|v| {
+                v.as_object()
+                    .and_then(|m| m.get("_sbyml_bytes"))
+                    .and_then(|s| s.as_str())
+            }) {
+                return Ok(Some(base64_decode(b64)?));
+            }
+            Ok(None) // YAML fallback
+        }
+        Some("ActorInfo") => {
+            let compressed = actorinfo_output_to_sbyml(out)?;
+            Ok(Some(compressed))
+        }
+        Some("BYML") => {
+            use roead::byml::Byml;
+            let val = serde_json::to_value(out)?;
+            if let Some(entries_map) = val.get("entries").and_then(|v| v.as_object()) {
+                for entries_val in entries_map.values() {
+                    if let Some(section) = entries_val.as_object() {
+                        if let Some(entry) = section.get("__byml__") {
+                            if let Some(json_text) =
+                                entry.get("attributes").and_then(|a| a.as_str())
+                            {
+                                let val: serde_json::Value = serde_json::from_str(json_text)?;
+                                let byml: Byml = serde_json::from_value(val)?;
+                                return Ok(Some(roead::yaz0::compress(byml.to_binary(roead::Endian::Big))));
+                            }
+                        }
+                    }
+                }
+                let byml: Byml = serde_json::from_value(serde_json::to_value(&out.entries)?)?;
+                return Ok(Some(roead::yaz0::compress(byml.to_binary(roead::Endian::Big))));
+            }
+            Ok(None)
+        }
+        Some("SarcMap") | Some("Binary") => Ok(None), // YAML fallback
+        Some("AAMP") => Ok(None), // YAML fallback
+        _ => Ok(None), // YAML fallback
+    }
+}
+
+/// Dispatch rebuild: convert edited Output into CBOR/SARC binary for ZIP injection.
+fn dispatch_rebuild(out: &Output, stem: &str) -> Result<Vec<u8>> {
+    match out.format.as_deref() {
+        Some("BYML") => rebuild_byml_from_output(out),
+        Some("Mergeable") => {
+            if let Some(b64) = out.entries.values().find_map(|v| {
+                v.as_object()
+                    .and_then(|m| m.get("_sbyml_bytes"))
+                    .and_then(|s| s.as_str())
+            }) {
+                let sbyml_bytes = base64_decode(b64)?;
+                let byml_data = decompress(&sbyml_bytes)
+                    .context("Failed to decompress mergeable BYML")?;
+                sbyml_to_mergeable_cbor(&byml_data, stem)
+            } else {
+                rebuild_mergeable_from_output(out)
+            }
+        }
+        Some("ActorInfo") => {
+            let raw = rebuild_actorinfo_from_output(out)?;
+            zstd_compress(&raw)
+        }
+        Some("SarcMap") => rebuild_sarcmap_from_output(out),
+        Some("Binary") => rebuild_binary_from_output(out),
+        _ => from_json_to_cbor(out),
+    }
 }
 
 /// Try to decompress a zstd-compressed buffer using the custom UKMM dictionary.
@@ -383,22 +493,24 @@ fn from_json_to_cbor(out: &Output) -> Result<Vec<u8>> {
 ///
 /// This handles the common case where `.product.sarc` files are:
 ///   zstd-compressed → Yaz0 archive → SARC or CBOR inside.
-fn decompress(raw: &[u8]) -> Result<Vec<u8>> {
-    // Check for zstd magic bytes: 0x28 0xB5 0x2F 0xFD
-    let is_zstd = raw.len() > 4 && raw[0..4] == [0x28, 0xB5, 0x2F, 0xFD];
-    let d = if is_zstd {
+fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+    let d = if data.len() > 4 && data[0..4] == ZSTD_MAGIC {
         eprintln!("zstd...");
-        zstd_decompress(raw)?
+        zstd_decompress(data)?
     } else {
-        raw.to_vec()
+        // Check for direct yaz0 (non-zstd-wrapped) — common for raw .bshop files.
+        if data.len() > 4 && data[0..4] == *b"Yaz0" {
+            eprintln!("yaz0...");
+            return Ok(roead::yaz0::decompress(data)?);
+        }
+        return Ok(data.to_vec());
     };
-    // Check for yaz0 magic after zstd decompression
+    // Check for yaz0 inside zstd
     if d.len() > 4 && d[0..4] == *b"Yaz0" {
         eprintln!("yaz0...");
-        Ok(roead::yaz0::decompress(&d)?)
-    } else {
-        Ok(d)
+        return Ok(roead::yaz0::decompress(&d)?);
     }
+    Ok(d)
 }
 
 /// Heuristic: does this byte buffer look like a SARC archive?
@@ -430,7 +542,7 @@ fn looks_like_byml(d: &[u8]) -> bool {
 ///
 /// AAMP magic is `AAMP` at offset 0 (0x41 0x41 0x4D 0x50).
 fn looks_like_aamp(d: &[u8]) -> bool {
-    d.len() > 8 && d[0..4] == [0x41, 0x41, 0x4D, 0x50]
+    d.len() > 8 && d[0..4] == *b"AAMP"
 }
 
 /// Parse an AAMP (`.bshop` / `.aamp`) binary file into an `Output`.
@@ -564,9 +676,6 @@ fn extract_cbor_strings(data: &[u8]) -> Vec<String> {
                         // On 32-bit targets, skip strings that don't fit in address space.
                         #[cfg(target_pointer_width = "32")]
                         if n > usize::MAX as u64 {
-                            eprintln!(
-                                "Warning: CBOR string length {n} exceeds addressable memory; skipping"
-                            );
                             i += 9;
                             continue;
                         }
@@ -575,18 +684,12 @@ fn extract_cbor_strings(data: &[u8]) -> Vec<String> {
 
                     // Reserved AI values (28-30): valid CBOR but no defined string encoding.
                     28..=30 => {
-                        eprintln!(
-                            "Warning: CBOR reserved additional info {ai} for string at offset {i}; skipping byte"
-                        );
                         i += 1;
                         continue;
                     }
 
                     // Indefinite-length strings (AI 31): not supported.
                     31 => {
-                        eprintln!(
-                            "Warning: CBOR indefinite-length string at offset {i} not supported; skipping"
-                        );
                         i += 1;
                         continue;
                     }
@@ -597,9 +700,6 @@ fn extract_cbor_strings(data: &[u8]) -> Vec<String> {
                 };
 
                 if sl > MAX_STRING_LEN {
-                    eprintln!(
-                        "Warning: CBOR string length {sl} exceeds safety limit of {MAX_STRING_LEN} bytes; skipping"
-                    );
                     i += adv;
                     continue;
                 }
@@ -630,9 +730,6 @@ fn extract_cbor_strings(data: &[u8]) -> Vec<String> {
                     27 => 8,
                     // Reserved / indefinite-length containers.
                     28..=31 => {
-                        eprintln!(
-                            "Warning: CBOR unsupported container AI {ai} at offset {i}; skipping"
-                        );
                         i += 1;
                         continue;
                     }
@@ -818,7 +915,7 @@ fn write_output(out: &Output, path: &Path) -> Result<()> {
     }
     let mut val = serde_json::to_value(out)?;
 
-    // Strip fields that are redundant or cause validation issues.
+    // Strip fields that are still present (already skipped when None by serde).
     // At rebuild time, the format is auto-detected from the entries structure.
     if let Some(obj) = val.as_object_mut() {
         obj.remove("language");
@@ -849,53 +946,87 @@ fn write_output(out: &Output, path: &Path) -> Result<()> {
 /// - **BYML**: the entry value contains a `"__byml__"` key (legacy wrapper).
 /// - **default** (message): standard Msyt entries with `"contents"` arrays.
 fn detect_format(entries: &BTreeMap<String, serde_json::Value>) -> Option<&'static str> {
-    // Empty → can't determine.
     if entries.is_empty() {
         return None;
     }
 
-    // Count how many entries look like each format.
     let mut mergeable = 0usize;
     let mut actorinfo = 0usize;
     let mut byml = 0usize;
+    let mut sarcmap = 0usize;
+    let mut binary = 0usize;
     let mut message = 0usize;
 
-    for val in entries.values() {
-        match val {
-            // Mergeable: `{ "Mergeable": { ... } }` — top-level key is "Mergeable"
-            serde_json::Value::Object(map) if map.contains_key("Mergeable") => {
-                mergeable += 1;
-            }
-            // BYML: contains "__byml__" key
-            serde_json::Value::Object(map) if map.contains_key("__byml__") => {
-                byml += 1;
-            }
-            // ActorInfo: at least one key is a decimal u32, value is [obj, bool]
-            serde_json::Value::Object(map) => {
-                let has_hash = map.keys().any(|k| k.parse::<u32>().is_ok());
-                let is_actor = has_hash
-                    && map.values().any(|v| {
-                        v.as_array()
-                            .map(|a| {
-                                a.len() == 2
-                                    && a[0].is_object()
-                                    && (a[1].is_boolean() || a[1].is_null())
-                            })
-                            .unwrap_or(false)
-                    });
-                if is_actor {
-                    actorinfo += 1;
-                } else {
-                    message += 1;
+    for (key, val) in entries.iter() {
+        // Check by entry key first for formats with distinctive key names.
+        if key == "sarc_map" {
+            sarcmap += 1;
+        } else if key == "_data" {
+            binary += 1;
+        } else if key == "_sbyml_bytes" {
+            mergeable += 1;
+        } else {
+            match val {
+                // Mergeable (raw JSON with "Mergeable" key)
+                serde_json::Value::Object(map) if map.contains_key("Mergeable") => {
+                    mergeable += 1;
                 }
+                // BYML: contains "__byml__" key
+                serde_json::Value::Object(map) if map.contains_key("__byml__") => {
+                    byml += 1;
+                }
+                // ActorInfo: at least one key is a decimal u32, value is [obj, bool]
+                serde_json::Value::Object(map) => {
+                    let has_hash = map.keys().any(|k| k.parse::<u32>().is_ok());
+                    let is_actor = has_hash
+                        && map.values().any(|v| {
+                            v.as_array()
+                                .map(|a| {
+                                    a.len() == 2
+                                        && a[0].is_object()
+                                        && (a[1].is_boolean() || a[1].is_null())
+                                })
+                                .unwrap_or(false)
+                        });
+                    if is_actor {
+                        actorinfo += 1;
+                    } else {
+                        message += 1;
+                    }
+                }
+                _ => message += 1,
             }
-            // Arrays or scalars → assume message context
-            _ => message += 1,
+        }
+
+        // Early exit: if one format already dominates, return immediately.
+        let total = mergeable + actorinfo + byml + sarcmap + binary + message;
+        if total == 1 {
+            continue;
+        }
+        let half = total / 2;
+        if mergeable > half {
+            return Some("Mergeable");
+        }
+        if actorinfo > half {
+            return Some("ActorInfo");
+        }
+        if byml > half {
+            return Some("BYML");
+        }
+        if sarcmap > half {
+            return Some("SarcMap");
+        }
+        if binary > half {
+            return Some("Binary");
         }
     }
 
-    // Pick the format with the most votes (deterministic tie-breaking).
-    let max = mergeable.max(actorinfo).max(byml).max(message);
+    let max = mergeable
+        .max(actorinfo)
+        .max(byml)
+        .max(sarcmap)
+        .max(binary)
+        .max(message);
     if max == 0 {
         return None;
     }
@@ -905,9 +1036,92 @@ fn detect_format(entries: &BTreeMap<String, serde_json::Value>) -> Option<&'stat
         Some("ActorInfo")
     } else if byml == max {
         Some("BYML")
+    } else if sarcmap == max {
+        Some("SarcMap")
+    } else if binary == max {
+        Some("Binary")
     } else {
         None
-    } // message entries need no format hint
+    }
+}
+
+/// Process a single file passed via CLI or drag-drop.
+///
+/// Routes to the correct conversion based on extension and content:
+/// - `.byml`/`.sbyml` → forward conversion (BYML/ActorInfo → YAML/.sbyml)
+/// - `.bshop`/`.aamp`/`.sbshop` → forward conversion (AAMP → YAML)
+/// - `.yaml`/`.yml` → reverse conversion (AAMP YAML → binary) if it's AAMP
+fn process_single_file(path: &str) -> Result<()> {
+    let p = Path::new(path);
+    if !p.exists() {
+        anyhow::bail!("File not found: {}", path);
+    }
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    match ext {
+        "byml" | "sbyml" => {
+            let out = convert_file(path)?;
+            let stem = filename_stem(p);
+
+            if out.format.as_deref() == Some("ActorInfo") {
+                let compressed = actorinfo_output_to_sbyml(&out)?;
+                let sbyml_name = if stem.ends_with(".product") {
+                    stem.to_string() + ".sbyml"
+                } else {
+                    format!("{stem}.product.sbyml")
+                };
+                let output_path = p.with_file_name(&sbyml_name);
+                fs::write(&output_path, &compressed)?;
+                println!("  ✓ Converted to native BYML: {}", output_path.display());
+            } else {
+                let output_path = p.with_file_name(format!("{stem}.yaml"));
+                write_output(&out, &output_path)?;
+            }
+            println!("\nDone!\n");
+            Ok(())
+        }
+        "bshop" | "aamp" | "sbshop" => {
+            let out = convert_file(path)?;
+            let stem = filename_stem(p);
+            let output_path = p.with_file_name(format!("{stem}.yaml"));
+            write_output(&out, &output_path)?;
+            println!("\nDone!\n");
+            Ok(())
+        }
+        "yaml" | "yml" => {
+            try_rebuild_aamp(path)
+        }
+        _ => {
+            anyhow::bail!("Unsupported file extension: .{ext}");
+        }
+    }
+}
+
+/// Try to rebuild an AAMP binary from a YAML file containing `!io` text.
+/// Returns Ok(()) on success, or a descriptive error if not AAMP.
+fn try_rebuild_aamp(path: &str) -> Result<()> {
+    let p = Path::new(path);
+    let yaml_text = fs::read_to_string(path)?;
+    let val: serde_json::Value = serde_yaml::from_str(&yaml_text)?;
+    if let Some(entries) = val.get("entries").and_then(|v| v.as_object()) {
+        if let Some(aamp_text) = entries.values().next().and_then(|v| v.as_str()) {
+            if aamp_text.contains("!io") && aamp_text.contains("param_root") {
+                let pio = roead::aamp::ParameterIO::from_text(aamp_text)
+                    .context("Failed to parse AAMP text")?;
+                let stem = filename_stem(p);
+                let out_name = stem
+                    .strip_suffix(".yaml")
+                    .or_else(|| stem.strip_suffix(".yml"))
+                    .unwrap_or(&stem);
+                let output_path = p.with_file_name(out_name);
+                fs::write(&output_path, pio.to_binary())?;
+                println!("  ✓ Rebuilt AAMP: {}", output_path.display());
+                println!("\nDone!\n");
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!("YAML file is not AAMP format (missing !io / param_root)");
 }
 
 fn main() -> Result<()> {
@@ -917,73 +1131,10 @@ fn main() -> Result<()> {
     // bypass the menu and process it directly.
     if let Some(arg) = args.first() {
         let path = arg.trim_matches('"');
-        let p = Path::new(path);
-        if !p.exists() {
+        if !Path::new(path).exists() {
             anyhow::bail!("File not found: {}", path);
         }
-        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-        match ext {
-            "byml" | "sbyml" => {
-                let out = convert_file(path)?;
-                let stem = filename_stem(p);
-
-                // ── ActorInfo → direct .sbyml (BYML natif) ──────────────
-                if out.format.as_deref() == Some("ActorInfo") {
-                    let compressed = actorinfo_output_to_sbyml(&out)?;
-                    let sbyml_name = if stem.ends_with(".product") {
-                        stem.to_string() + ".sbyml"
-                    } else {
-                        format!("{stem}.product.sbyml")
-                    };
-                    let output_path = p.with_file_name(&sbyml_name);
-                    fs::write(&output_path, &compressed)?;
-                    println!("  ✓ Converted to native BYML: {}", output_path.display());
-                    println!("\nDone!\n");
-                    return Ok(());
-                }
-
-                // ── Other formats → YAML ──────────────────────────────────
-                let output_path = p.with_file_name(format!("{stem}.yaml"));
-                write_output(&out, &output_path)?;
-                println!("\nDone!\n");
-                return Ok(());
-            }
-            // ── AAMP / bshop / aamp ───────────────────────────────────────
-            "bshop" | "aamp" | "sbshop" => {
-                let out = convert_file(path)?;
-                let stem = filename_stem(p);
-                let output_path = p.with_file_name(format!("{stem}.yaml"));
-                write_output(&out, &output_path)?;
-                println!("\nDone!\n");
-                return Ok(());
-            }
-            // ── AAMP YAML → rebuild ──────────────────────────────────────
-            "yaml" | "yml" => {
-                // Read as Output first, check if it contains AAMP text
-                let yaml_text = fs::read_to_string(path)?;
-                let val: serde_json::Value = serde_yaml::from_str(&yaml_text)?;
-                if let Some(entries) = val.get("entries").and_then(|v| v.as_object()) {
-                    if let Some(aamp_text) = entries.values().next().and_then(|v| v.as_str()) {
-                        if aamp_text.contains("!io") && aamp_text.contains("param_root") {
-                            let pio = roead::aamp::ParameterIO::from_text(aamp_text)
-                                .context("Failed to parse AAMP text")?;
-                            let stem = filename_stem(p);
-                            let out_name = stem
-                                .strip_suffix(".yaml")
-                                .or_else(|| stem.strip_suffix(".yml"))
-                                .unwrap_or(&stem);
-                            let output_path = p.with_file_name(out_name);
-                            fs::write(&output_path, pio.to_binary())?;
-                            println!("  ✓ Rebuilt AAMP: {}", output_path.display());
-                            println!("\nDone!\n");
-                            return Ok(());
-                        }
-                    }
-                }
-                // Not AAMP text, fall through
-            }
-            _ => {} // fall through to interactive
-        }
+        return process_single_file(path);
     }
 
     // On Linux, when launched by double-click, there's no terminal attached.
@@ -1047,80 +1198,13 @@ fn prompt(message: &str) -> String {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        match ext {
-            "bshop" | "aamp" | "sbshop" => {
-                eprintln!();
-                match convert_file(path) {
-                    Ok(out) => {
-                        let p = Path::new(path);
-                        let stem = filename_stem(p);
-                        let output_path = p.with_file_name(format!("{stem}.yaml"));
-                        if let Err(e) = write_output(&out, &output_path) {
-                            eprintln!("Error writing output: {e:#}");
-                        } else {
-                            eprintln!("\nDone!\n");
-                        }
-                    }
-                    Err(e) => eprintln!("Error: {e:#}"),
-                }
-                prompt("\nPress Enter to exit... ");
-                std::process::exit(0);
+        if matches!(ext, "byml" | "sbyml" | "bshop" | "aamp" | "sbshop" | "yaml" | "yml") {
+            eprintln!();
+            if let Err(e) = process_single_file(path) {
+                eprintln!("Error: {e:#}");
             }
-            "byml" | "sbyml" => {
-                eprintln!();
-                match convert_file(path) {
-                    Ok(out) => {
-                        let p = Path::new(path);
-                        let stem = filename_stem(p);
-                        let output_path = p.with_file_name(format!("{stem}.yaml"));
-                        if let Err(e) = write_output(&out, &output_path) {
-                            eprintln!("Error writing output: {e:#}");
-                        } else {
-                            eprintln!("\nDone!\n");
-                        }
-                    }
-                    Err(e) => eprintln!("Error: {e:#}"),
-                }
-                prompt("\nPress Enter to exit... ");
-                std::process::exit(0);
-            }
-            "yaml" | "yml" => {
-                // Try AAMP rebuild first, fall through on failure
-                if let Ok(yaml_text) = fs::read_to_string(path) {
-                    if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(&yaml_text) {
-                        if let Some(entries) = val.get("entries").and_then(|v| v.as_object()) {
-                            if let Some(aamp_text) =
-                                entries.values().next().and_then(|v| v.as_str())
-                            {
-                                if aamp_text.contains("!io") && aamp_text.contains("param_root") {
-                                    if let Ok(pio) = roead::aamp::ParameterIO::from_text(aamp_text)
-                                    {
-                                        let p = Path::new(path);
-                                        let stem = filename_stem(p);
-                                        let out_name = stem
-                                            .strip_suffix(".yaml")
-                                            .or_else(|| stem.strip_suffix(".yml"))
-                                            .unwrap_or(&stem);
-                                        let output_path = p.with_file_name(out_name);
-                                        if let Err(e) = fs::write(&output_path, pio.to_binary()) {
-                                            eprintln!("Error writing AAMP: {e:#}");
-                                        } else {
-                                            eprintln!(
-                                                "  ✓ Rebuilt AAMP: {}",
-                                                output_path.display()
-                                            );
-                                            eprintln!("\nDone!\n");
-                                        }
-                                        prompt("\nPress Enter to exit... ");
-                                        std::process::exit(0);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
+            prompt("\nPress Enter to exit... ");
+            std::process::exit(0);
         }
     }
 
@@ -1221,16 +1305,16 @@ fn collect_edited_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-/// Interactive mode: scan UKMM mods, pick one, convert all message files.
+/// Interactive mode: scan UKMM mods, pick one, convert all resource files.
 ///
 /// # Flow
 ///
 /// 1. Ask user to select platform (Wii U / Switch)
-/// 2. Scan the corresponding UKMM mods directory for ZIPs (with `Msg_*` files)
-///    and loose folders (with `meta.yml` + `Msg_*` files)
+/// 2. Scan the corresponding UKMM mods directory for ZIPs (with UKMM resource files)
+///    and loose folders (with `meta.yml`)
 /// 3. Present a numbered list, let the user choose
 /// 4. Extract/copy the mod to a temp directory
-/// 5. Convert each `Msg_*.product.sarc` file to JSON under `mods/<platform>/<mod_name>/`
+/// 5. Convert each resource file to YAML or BYML under `mods/<platform>/<mod_name>/`
 /// 6. Save the original mod as `<mod_name>_backup.zip`
 /// 7. If output already exists, offer to rebuild instead
 fn run_interactive() -> Result<()> {
@@ -1306,28 +1390,13 @@ fn run_interactive() -> Result<()> {
 
     let mut mods: Vec<ModEntry> = Vec::new();
 
-    // Pass 1: ZIP files containing any UKMM resource files.
-    if let Ok(entries) = fs::read_dir(&mods_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "zip") && peek_zip_has_ukmm_resources(&path) {
-                let display = read_zip_meta_name(&path).unwrap_or_else(|| filename_stem(&path));
-                mods.push(ModEntry {
-                    display_name: display,
-                    path,
-                    is_dir: false,
-                });
-            }
-        }
-    }
-
-    // Pass 2: Loose directories with meta.yml and UKMM resource files.
     if let Ok(entries) = fs::read_dir(&mods_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
                 let meta_path = path.join("meta.yml");
-                if meta_path.is_file() && !find_resource_files(&path).is_empty() {
+                if meta_path.is_file() {
+                    // Accept any directory with meta.yml (all UKMM mods have it).
                     let display =
                         read_meta_name(&meta_path).unwrap_or_else(|| filename_stem(&path));
                     mods.push(ModEntry {
@@ -1336,6 +1405,27 @@ fn run_interactive() -> Result<()> {
                         is_dir: true,
                     });
                 }
+            } else if path.extension().is_some_and(|e| e == "zip") {
+                let display =
+                    read_zip_meta_name(&path).unwrap_or_else(|| filename_stem(&path));
+                // Only show mods with meta.yml (filter loose zip files)
+                if !display.is_empty() && display != filename_stem(&path) {
+                    mods.push(ModEntry {
+                        display_name: display,
+                        path,
+                        is_dir: false,
+                    });
+                }
+            } else if path.extension().is_some_and(|e| e == "zip") {
+                // Fallback: accept any ZIP it's an UKMM mod
+                // Accept any ZIP with meta.yml (even without known resource extensions).
+                let display =
+                    read_zip_meta_name(&path).unwrap_or_else(|| filename_stem(&path));
+                mods.push(ModEntry {
+                    display_name: display,
+                    path,
+                    is_dir: false,
+                });
             }
         }
     }
@@ -1349,7 +1439,7 @@ fn run_interactive() -> Result<()> {
 
     // ── Mod selection ─────────────────────────────────────────────────────
     let mod_label = if mods.len() == 1 { "mod" } else { "mods" };
-    println!("Found {} {} with text inside:\n", mods.len(), mod_label);
+    println!("Found {} {}:\n", mods.len(), mod_label);
     for (i, m) in mods.iter().enumerate() {
         println!("  [{:2}] {}", i + 1, m.display_name);
     }
@@ -1452,7 +1542,7 @@ fn run_interactive() -> Result<()> {
             continue;
         }
 
-        // All other resource files: run through the full format pipeline
+        // Use dispatch_extract for the standard format pipeline.
         let out = match convert_file(&file_path) {
             Ok(o) => o,
             Err(e) => {
@@ -1467,138 +1557,40 @@ fn run_interactive() -> Result<()> {
             .to_path_buf();
         fs::create_dir_all(&parent_dir)?;
 
-        // Mergeable → .sbyml (roead format) or .yaml (fallback)
-        if out.format.as_deref() == Some("Mergeable") {
-            if let Some(b64) = out.entries.get("_sbyml_bytes").and_then(|v| v.as_str()) {
-                let sbyml_bytes = base64_decode(b64)?;
-                let mut sbyml_name = mods_out_dir.join(relative);
-                sbyml_name.set_extension("sbyml");
-                if let Some(parent) = sbyml_name.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&sbyml_name, &sbyml_bytes)?;
-                eprintln!("  ✓ Converted to native BYML: {}", sbyml_name.display());
-            } else {
-                // Not in roead serde format — write as YAML.
-                let output_path = mods_out_dir.join(relative).with_extension("yaml");
+        let output_path = mods_out_dir.join(relative).with_extension(extract_extension(&out));
+        match dispatch_extract(&out)? {
+            Some(bytes) => {
+                fs::write(&output_path, &bytes)?;
+                eprintln!("  ✓ Converted to native BYML: {}", output_path.display());
+            }
+            None => {
                 write_output(&out, &output_path)?;
             }
-            continue;
         }
-
-        // ActorInfo → .sbyml natif
-        if out.format.as_deref() == Some("ActorInfo") {
-            let compressed = actorinfo_output_to_sbyml(&out)?;
-            let mut sbyml_name = mods_out_dir.join(relative);
-            sbyml_name.set_extension("sbyml");
-            fs::write(&sbyml_name, &compressed)?;
-            eprintln!("  ✓ Converted to native BYML: {}", sbyml_name.display());
-            continue;
-        }
-
-        // Autres BYML simples → .sbyml natif
-        if out.format.as_deref() == Some("BYML") {
-            let compressed = {
-                use roead::byml::Byml;
-                let val = serde_json::to_value(&out)?;
-                if let Some(entries_map) = val.get("entries").and_then(|v| v.as_object()) {
-                    let mut found = false;
-                    let mut result = None;
-                    for entries_val in entries_map.values() {
-                        if let Some(section) = entries_val.as_object() {
-                            if let Some(entry) = section.get("__byml__") {
-                                if let Some(json_text) =
-                                    entry.get("attributes").and_then(|a| a.as_str())
-                                {
-                                    let val: serde_json::Value = serde_json::from_str(json_text)?;
-                                    let byml: Byml = serde_json::from_value(val)?;
-                                    let binary = byml.to_binary(roead::Endian::Big);
-                                    result = Some(roead::yaz0::compress(&binary));
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if found {
-                        result
-                    } else {
-                        let byml: Byml =
-                            serde_json::from_value(serde_json::to_value(&out.entries)?)?;
-                        let binary = byml.to_binary(roead::Endian::Big);
-                        Some(roead::yaz0::compress(&binary))
-                    }
-                } else {
-                    None
-                }
-            };
-
-            if let Some(sbyml_bytes) = compressed {
-                let mut sbyml_name = mods_out_dir.join(relative);
-                sbyml_name.set_extension("sbyml");
-                fs::write(&sbyml_name, &sbyml_bytes)?;
-                eprintln!("  ✓ Converted to native BYML: {}", sbyml_name.display());
-            } else {
-                let output_path = mods_out_dir.join(relative).with_extension("yaml");
-                write_output(&out, &output_path)?;
-            }
-            continue;
-        }
-
-        // SarcMap → YAML containing file list
-        if out.format.as_deref() == Some("SarcMap") {
-            let output_path = mods_out_dir.join(relative).with_extension("yaml");
-            write_output(&out, &output_path)?;
-            continue;
-        }
-
-        // Binary → write raw bytes to a flat file
-        if out.format.as_deref() == Some("Binary") {
-            if let Some(b64) = out.entries.get("_data").and_then(|v| v.as_str()) {
-                let raw_bytes = base64_decode(b64)?;
-                let bin_path = mods_out_dir.join(relative);
-                if let Some(parent) = bin_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&bin_path, &raw_bytes)?;
-                eprintln!("  ✓ Extracted binary: {}", bin_path.display());
-            }
-            continue;
-        }
-
-        // AAMP → write the text representation as .yaml
-        if out.format.as_deref() == Some("AAMP") {
-            let output_path = mods_out_dir.join(relative).with_extension("yaml");
-            write_output(&out, &output_path)?;
-            continue;
-        }
-
-        // Fallback: YAML
-        let output_path = mods_out_dir.join(relative).with_extension("yaml");
-        write_output(&out, &output_path)?;
     }
 
-    // ── Save backup ───────────────────────────────────────────────────────
-    fs::create_dir_all(&mods_out_dir)?;
+    // ── Save backup (only if it doesn't already exist) ────────────────────
     let backup_name = format!("{mod_name}_backup.zip");
     let backup_path = mods_out_dir.join(&backup_name);
 
-    if !chosen.is_dir {
-        fs::copy(&chosen.path, &backup_path)?;
-        println!("  ✓ Backup saved: {}", backup_path.display());
-    } else {
-        create_zip_from_dir(&extract_dir, &backup_path)?;
+    if !backup_path.exists() {
+        fs::create_dir_all(&mods_out_dir)?;
+        if !chosen.is_dir {
+            fs::copy(&chosen.path, &backup_path)?;
+            println!("  ✓ Backup saved: {}", backup_path.display());
+        } else {
+            create_zip_from_dir(&extract_dir, &backup_path)?;
+        }
     }
 
     fs::remove_dir_all(&extract_dir)?;
 
-    // ── Summary ───────────────────────────────────────────────────────────
+    // ── Summary ──────────────────────────────────────────────────────────
     println!("\n── Summary ──");
     println!("  Platform:     {platform}");
     println!("  Mod:          {}", chosen.display_name);
     println!("  Files:        {}", resource_files.len());
     println!("  Output:       {}", mods_out_dir.display());
-    println!("  Backup:       {backup_name}");
     println!("\nDone!\n");
     open_explorer(&mods_out_dir);
 
@@ -1650,8 +1642,10 @@ fn run_rebuild(
     }
 
     // ── Convert each edited file back to a CBOR SARC or BYML blob ────────
-    let mut converted: Vec<(String, Vec<u8>, bool)> = Vec::new(); // (zip_entry_name, data, is_byml)
+    let mut converted: Vec<(String, Vec<u8>)> = Vec::new();
     for file_path in &edited_files {
+        // Preserve relative path from workspace for correct ZIP entry location.
+        let relative = file_path.strip_prefix(mods_out_dir).unwrap_or(file_path);
         let stem = file_path
             .file_stem()
             .and_then(OsStr::to_str)
@@ -1681,23 +1675,25 @@ fn run_rebuild(
 
             if is_mergeable {
                 let cbor_bytes = sbyml_to_mergeable_cbor(&data, stem)?;
-                let byml_name = format!("{stem}.byml");
+                let zip_entry = relative.with_extension("byml");
+                let zip_name = zip_entry.to_string_lossy().to_string();
                 println!(
-                    "  Converting (Mergeable): {} → {byml_name}",
+                    "  Converting (Mergeable): {} → {zip_name}",
                     file_path.file_name().unwrap_or_default().to_string_lossy()
                 );
-                converted.push((byml_name, cbor_bytes, true));
+                converted.push((zip_name, cbor_bytes));
             } else {
                 // Native ActorInfo BYML (Actors/Hashes format).
                 let out = parse_byml_actorinfo(&data, &file_path.to_string_lossy())?;
                 let raw_cbor = rebuild_actorinfo_from_output(&out)?;
                 let compressed = zstd_compress(&raw_cbor)?;
-                let byml_name = format!("{stem}.byml");
+                let zip_entry = relative.with_extension("byml");
+                let zip_name = zip_entry.to_string_lossy().to_string();
                 println!(
-                    "  Converting (ActorInfo): {} → {byml_name}",
+                    "  Converting (ActorInfo): {} → {zip_name}",
                     file_path.file_name().unwrap_or_default().to_string_lossy()
                 );
-                converted.push((byml_name, compressed, true));
+                converted.push((zip_name, compressed));
             }
             continue;
         }
@@ -1715,56 +1711,23 @@ fn run_rebuild(
             out.format = detect_format(&out.entries).map(String::from);
         }
 
-        if out.format.as_deref() == Some("BYML") {
-            let byml_bytes = rebuild_byml_from_output(&out)?;
-            let byml_name = format!("{stem}.byml");
-            println!(
-                "  Converting: {} → {byml_name}",
-                file_path.file_name().unwrap_or_default().to_string_lossy()
-            );
-            converted.push((byml_name, byml_bytes, true));
-        } else if out.format.as_deref() == Some("Mergeable") {
-            let cbor_bytes = rebuild_mergeable_from_output(&out)?;
-            let byml_name = format!("{stem}.byml");
-            println!(
-                "  Converting (Mergeable): {} → {byml_name}",
-                file_path.file_name().unwrap_or_default().to_string_lossy()
-            );
-            converted.push((byml_name, cbor_bytes, true));
-        } else if out.format.as_deref() == Some("ActorInfo") {
-            let raw_bytes = rebuild_actorinfo_from_output(&out)?;
-            let compressed = zstd_compress(&raw_bytes)?;
-            let byml_name = format!("{stem}.byml");
-            println!(
-                "  Converting (ActorInfo): {} → {byml_name}",
-                file_path.file_name().unwrap_or_default().to_string_lossy()
-            );
-            converted.push((byml_name, compressed, true));
-        } else if out.format.as_deref() == Some("SarcMap") {
-            let cbor_bytes = rebuild_sarcmap_from_output(&out)?;
-            let out_name = format!("{stem}.srsarc"); // stored with .sarc stem, rebuilt as CBOR
-            println!(
-                "  Converting (SarcMap): {} → {out_name}",
-                file_path.file_name().unwrap_or_default().to_string_lossy()
-            );
-            converted.push((out_name, cbor_bytes, true));
-        } else if out.format.as_deref() == Some("Binary") {
-            let cbor_bytes = rebuild_binary_from_output(&out)?;
-            let out_name = format!("{stem}.bin");
-            println!(
-                "  Converting (Binary): {} → {out_name}",
-                file_path.file_name().unwrap_or_default().to_string_lossy()
-            );
-            converted.push((out_name, cbor_bytes, true));
-        } else {
-            let sarc_name = format!("{stem}.sarc");
-            println!(
-                "  Converting: {} → {sarc_name}",
-                file_path.file_name().unwrap_or_default().to_string_lossy()
-            );
-            let sarc_bytes = from_json_to_cbor(&out)?;
-            converted.push((sarc_name, sarc_bytes, false));
-        }
+        let zip_name = relative
+            .with_extension(rebuild_extension(&out))
+            .to_string_lossy()
+            .to_string();
+
+        let stem = file_path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap_or("unknown");
+
+        let format_label = out.format.as_deref().unwrap_or("Message");
+        let cbor_bytes = dispatch_rebuild(&out, stem)?;
+        println!(
+            "  Converting ({format_label}): {} → {zip_name}",
+            file_path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        converted.push((zip_name, cbor_bytes));
     }
 
     if converted.is_empty() {
@@ -1772,29 +1735,59 @@ fn run_rebuild(
     }
 
     // ── Build modified ZIP ────────────────────────────────────────────────
-    // Strategy: copy all entries from the backup ZIP except the ones we're
-    // replacing, then append the new entries under the appropriate prefix.
+    // Strategy: scan the backup ZIP to find the correct entry path for each
+    // converted file (by matching on filename stem), then copy all non-replaced
+    // entries and append the new ones.
     let backup_file = fs::File::open(&backup_path)?;
     let mut backup_archive = zip::ZipArchive::new(backup_file)?;
     let modified_file = fs::File::create(&modified_path)?;
     let mut modified_zip = zip::ZipWriter::new(modified_file);
 
-    let replace_names: Vec<String> = converted
-        .iter()
-        .map(|(name, _, is_byml)| {
-            if *is_byml {
-                format!("Actor/{name}")
-            } else {
-                format!("Message/{name}")
+    // Build a map: filename stem → full entry path in the backup ZIP.
+    // E.g., "EventInfo.product" → "Event/EventInfo.product.byml"
+    // This lets us find the right entry regardless of subdirectory nesting.
+    let mut backup_entry_map: BTreeMap<String, String> = BTreeMap::new();
+    for i in 0..backup_archive.len() {
+        if let Ok(entry) = backup_archive.by_index_raw(i) {
+            let name = entry.name().to_string();
+            let path = Path::new(&name);
+            if let Some(stem) = path.file_stem().and_then(OsStr::to_str) {
+                backup_entry_map.entry(stem.to_string()).or_insert(name);
             }
+        }
+    }
+
+    // Resolve the actual ZIP entry path for each converted file.
+    let resolved: Vec<(String, Vec<u8>)> = converted
+        .into_iter()
+        .map(|(workspace_path, data)| {
+            let path = Path::new(&workspace_path);
+            let stem = path
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .unwrap_or("");
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let target_name = format!("{stem}.{ext}");
+            // Look up the backup entry by stem; fall back to workspace path.
+            let zip_name = backup_entry_map
+                .remove(stem)
+                .unwrap_or_else(|| {
+                    eprintln!("  Warning: no backup entry found for '{target_name}', using workspace path");
+                    workspace_path
+                });
+            (zip_name, data)
         })
         .collect();
 
     // Copy all original entries, skipping the ones we're replacing.
+    let resolved_names: Vec<&str> = resolved.iter().map(|(n, _)| n.as_str()).collect();
     for i in 0..backup_archive.len() {
         let mut entry = backup_archive.by_index(i)?;
         let entry_name = entry.name().to_string();
-        if replace_names.contains(&entry_name) {
+        if resolved_names.contains(&entry_name.as_str()) {
             continue; // Replaced below.
         }
         let options = if entry.is_dir() {
@@ -1809,30 +1802,22 @@ fn run_rebuild(
         io::copy(&mut entry, &mut modified_zip)?;
     }
 
-    // Append the new (or modified) entries. Messages go under `Message/`,
-    // BYML files (e.g. actorinfo) go under `Actor/`. Both are stored
-    // without compression — they're already zstd-compressed.
-    for (entry_name, entry_bytes, _) in &converted {
-        let prefix = if entry_name.ends_with(".byml") {
-            "Actor"
-        } else {
-            "Message"
-        };
-        let zip_name = format!("{prefix}/{entry_name}");
+    // Append the new (or modified) entries using their resolved ZIP paths.
+    for (entry_name, entry_bytes) in &resolved {
         modified_zip.start_file::<&str, ()>(
-            &zip_name,
+            entry_name,
             zip::write::FileOptions::<()>::default()
                 .compression_method(zip::CompressionMethod::Stored),
         )?;
         modified_zip.write_all(entry_bytes)?;
-        println!("  Added: {zip_name}");
+        println!("  Added: {entry_name}");
     }
 
     modified_zip.finish()?;
 
     println!("\n── Summary ──");
     println!("  Modified ZIP: {}", modified_path.display());
-    println!("  Files converted: {}", converted.len());
+    println!("  Files converted: {}", resolved.len());
 
     // ── Copy modified ZIP back to UKMM mods directory ────────────────────
     if !is_dir {
@@ -1868,7 +1853,6 @@ fn run_rebuild(
     }
 
     println!("\nDone!\n");
-    open_explorer(mods_out_dir);
 
     Ok(())
 }
@@ -1920,6 +1904,7 @@ fn run_restore(mod_name: &str, mods_out_dir: &Path, mod_path: &Path, is_dir: boo
 ///
 /// Opens the ZIP and scans entry names without extracting data.
 /// Returns `false` for any I/O error (file not found, corrupt ZIP, etc.).
+#[allow(dead_code)]
 fn peek_zip_has_ukmm_resources(zip_path: &Path) -> bool {
     let file = match fs::File::open(zip_path) {
         Ok(f) => f,
@@ -2185,7 +2170,8 @@ fn parse_sarcmap_cbor(data: &[u8], _path: &str) -> Result<Output> {
 fn rebuild_sarcmap_from_output(out: &Output) -> Result<Vec<u8>> {
     if let Some(sarc_data) = out.entries.get("sarc_map") {
         let mut buf = Vec::with_capacity(65536);
-        json_to_cbor(sarc_data, &mut buf);
+        // Re-wrap with "Sarc" key: UKMM expects { "Sarc": { "alignment": N, "files": [...] } }
+        json_to_cbor(&serde_json::json!({ "Sarc": sarc_data }), &mut buf);
         return zstd_compress(&buf);
     }
     anyhow::bail!("No SarcMap data found in output");
@@ -2480,66 +2466,23 @@ fn f16_to_f64(bits: u16) -> f64 {
     }
 }
 
-/// Minimal base64 encode (RFC 4648) for byte strings.
+/// Base64 engine (RFC 4648, standard charset, padding enabled).
+const B64_ENGINE: base64::engine::GeneralPurpose =
+    base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::general_purpose::PAD,
+    );
+
+/// Encode bytes to base64 (RFC 4648) using the standard engine.
 fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(CHARS[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
+    B64_ENGINE.encode(data)
 }
 
-/// Minimal base64 decode (RFC 4648).
+/// Decode a base64 string (RFC 4648).
 fn base64_decode(input: &str) -> Result<Vec<u8>> {
-    fn decode_char(c: u8) -> Result<u8> {
-        match c {
-            b'A'..=b'Z' => Ok(c - b'A'),
-            b'a'..=b'z' => Ok(c - b'a' + 26),
-            b'0'..=b'9' => Ok(c - b'0' + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            b'=' => Ok(0),
-            _ => anyhow::bail!("Invalid base64 character: {c:#x}"),
-        }
-    }
-
-    let input = input.trim_end_matches('=');
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let bytes = input.as_bytes();
-    for chunk in bytes.chunks(4) {
-        let mut buf = [0u8; 4];
-        for (i, &b) in chunk.iter().enumerate() {
-            buf[i] = decode_char(b)?;
-        }
-        let triple = ((buf[0] as u32) << 18)
-            | ((buf[1] as u32) << 12)
-            | ((buf[2] as u32) << 6)
-            | (buf[3] as u32);
-        out.push((triple >> 16) as u8);
-        if chunk.len() > 2 {
-            out.push((triple >> 8) as u8);
-        }
-        if chunk.len() > 3 {
-            out.push(triple as u8);
-        }
-    }
-    Ok(out)
+    B64_ENGINE
+        .decode(input)
+        .context("Invalid base64 input")
 }
 
 /// Check whether a string looks like a base64-encoded binary blob.
@@ -2745,13 +2688,16 @@ fn sbyml_to_mergeable_cbor(byml_data: &[u8], default_type: &str) -> Result<Vec<u
     let val: serde_json::Value =
         serde_json::to_value(&byml).context("Failed to serialize mergeable BYML to JSON")?;
 
+    // Derive the proper DataType from the stem:
+    // "EventInfo.product" → "EventInfo", "ActorInfo.product" → "ActorInfo", etc.
+    let type_name = default_type
+        .strip_suffix(".product")
+        .unwrap_or(default_type);
+
     // Re-wrap: { "Mergeable": { "<DataType>": { ... } } }
-    // DataType derived from the filename stem (e.g. EffectInfo, EventInfo.product).
-    let outer = serde_json::json!({
-        "Mergeable": {
-            default_type: val
-        }
-    });
+    let mut inner = serde_json::Map::new();
+    inner.insert(type_name.to_string(), val);
+    let outer = serde_json::json!({ "Mergeable": inner });
 
     let mut buf = Vec::with_capacity(65536);
     json_to_cbor(&outer, &mut buf);
@@ -3070,33 +3016,13 @@ fn convert_file(path: &str) -> Result<Output> {
 
 /// Open Windows Explorer at the given directory.
 fn open_explorer(path: &Path) {
-    // Explorer.exe on Windows needs absolute paths with backslashes.
-    // Canonicalize the path to get an absolute, normalized form.
-    let abs = path.canonicalize().unwrap_or_else(|_| {
-        // If canonicalization fails (path doesn't exist yet), try parent.
-        path.parent()
+    let abs = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => path.parent()
             .and_then(|p| p.canonicalize().ok())
-            .unwrap_or_else(|| {
-                // Last resort: use the path as-is.
-                if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    // Prepend CWD for relative paths.
-                    let mut cwd = std::env::current_dir().unwrap_or_default();
-                    cwd.push(path);
-                    cwd
-                }
-            })
-    });
-
-    if abs.is_dir() {
-        let _ = std::process::Command::new("explorer")
-            .arg(abs.as_os_str())
-            .spawn();
-    } else if abs.exists() {
-        let arg = format!("/select,{}", abs.display());
-        let _ = std::process::Command::new("explorer").arg(&arg).spawn();
-    }
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join(path)),
+    };
+    let _ = std::process::Command::new("explorer").arg(abs.as_os_str()).spawn();
 }
 
 /// Recursively copy a directory tree.
@@ -3440,7 +3366,7 @@ mod tests {
         };
         let result = from_json_to_cbor(&out).unwrap();
 
-        assert_eq!(&result[0..4], [0x28, 0xB5, 0x2F, 0xFD]);
+        assert_eq!(&result[0..4], &ZSTD_MAGIC);
 
         let decompressed = zstd_decompress(&result[..]).unwrap();
 
@@ -3707,16 +3633,16 @@ mod tests {
         assert_eq!(sarc_map.get("alignment").unwrap().as_u64(), Some(4));
         assert_eq!(sarc_map.get("files").unwrap().as_array().unwrap().len(), 2);
 
-        // Rebuild — note: rebuild_sarcmap_from_output re-encodes the JSON value
-        // directly as CBOR, wrapping only in the outer SarcMap structure.
+        // Rebuild — now wraps with "Sarc" key for UKMM compatibility.
         let rebuilt = rebuild_sarcmap_from_output(&out).unwrap();
 
         // The rebuilt output is zstd-compressed. Decompress to compare.
         let decompressed = zstd_decompress(&rebuilt).unwrap();
 
-        // Parse the decompressed CBOR and verify it has the right structure.
+        // Parse the decompressed CBOR and verify the outer "Sarc" wrapper.
         let val = cbor_to_json(&decompressed, &mut 0).unwrap();
-        let sarc = val.as_object().unwrap();
+        let wrapped = val.as_object().unwrap();
+        let sarc = wrapped.get("Sarc").unwrap().as_object().unwrap();
         assert_eq!(sarc.get("alignment").unwrap().as_u64(), Some(4));
         let files = sarc.get("files").unwrap().as_array().unwrap();
         assert_eq!(files.len(), 2);

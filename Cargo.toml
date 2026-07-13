@@ -8,7 +8,9 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 indexmap = { version = "2.7", features = ["serde"] }
+mimalloc = "0.1"
 msyt = { git = "https://github.com/NiceneNerd/msyt", rev = "12e4d95fb6480f445284f37706db7bfa8351dc06" }
 roead = { version = "1.0", features = ["with-serde", "yaml"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -17,3 +19,15 @@ serde_yaml = "0.9"
 zip = "2"
 zstd = { version = "0.13.3", features = ["experimental"] }
 atty = "0.2"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "pipeline_bench"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
