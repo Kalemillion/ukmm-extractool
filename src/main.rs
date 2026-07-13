@@ -17,6 +17,7 @@ use base64::Engine as _;
 use indexmap::IndexMap;
 use mimalloc::MiMalloc;
 use msyt::{model::Entry, Msyt};
+use rayon::prelude::*;
 use roead::sarc::Sarc;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -309,70 +310,9 @@ fn zstd_compress(data: &[u8]) -> Result<Vec<u8>> {
 /// - 256..=65535: 0x79 + 2-byte big-endian length
 /// - 65536..=0xFFFFFFFF: 0x7A + 4-byte big-endian length
 /// - >0xFFFFFFFF: 0x7B + 8-byte big-endian length
-fn cbor_write_text(buf: &mut Vec<u8>, s: &str) {
-    let len = s.len();
-    if len <= 23 {
-        buf.push(0x60 | (len as u8));
-    } else if len <= 0xFF {
-        buf.push(0x78);
-        buf.push(len as u8);
-    } else if len <= 0xFFFF {
-        buf.push(0x79);
-        buf.extend_from_slice(&(len as u16).to_be_bytes());
-    } else if len <= 0xFFFF_FFFF {
-        buf.push(0x7A);
-        buf.extend_from_slice(&(len as u32).to_be_bytes());
-    } else {
-        buf.push(0x7B);
-        buf.extend_from_slice(&(len as u64).to_be_bytes());
-    }
-    buf.extend_from_slice(s.as_bytes());
-}
-
-/// Encode a CBOR byte string (major type 2).
-///
-/// Same length-encoding scheme as text strings but with the byte string
-/// major type header (0x40-0x5B).
-fn cbor_write_bytes(buf: &mut Vec<u8>, data: &[u8]) {
-    let len = data.len();
-    if len <= 23 {
-        buf.push(0x40 | (len as u8));
-    } else if len <= 0xFF {
-        buf.push(0x58);
-        buf.push(len as u8);
-    } else if len <= 0xFFFF {
-        buf.push(0x59);
-        buf.extend_from_slice(&(len as u16).to_be_bytes());
-    } else if len <= 0xFFFF_FFFF {
-        buf.push(0x5A);
-        buf.extend_from_slice(&(len as u32).to_be_bytes());
-    } else {
-        buf.push(0x5B);
-        buf.extend_from_slice(&(len as u64).to_be_bytes());
-    }
-    buf.extend_from_slice(data);
-}
-
-/// Encode a CBOR map header (major type 5) with a given number of entries.
-///
-/// Uses the same length-encoding scheme as `cbor_write_text`:
-/// 0..=23 inline, then 1/2/4/8-byte prefixes for progressively larger sizes.
-fn cbor_write_map_header(buf: &mut Vec<u8>, len: usize) {
-    if len <= 23 {
-        buf.push(0xA0 | (len as u8));
-    } else if len <= 0xFF {
-        buf.push(0xB8);
-        buf.push(len as u8);
-    } else if len <= 0xFFFF {
-        buf.push(0xB9);
-        buf.extend_from_slice(&(len as u16).to_be_bytes());
-    } else if len <= 0xFFFF_FFFF {
-        buf.push(0xBA);
-        buf.extend_from_slice(&(len as u32).to_be_bytes());
-    } else {
-        buf.push(0xBB);
-        buf.extend_from_slice(&(len as u64).to_be_bytes());
-    }
+/// Helper: create a minicbor Encoder writing to a Vec<u8>.
+fn make_encoder(buf: &mut Vec<u8>) -> minicbor::Encoder<&mut Vec<u8>> {
+    minicbor::Encoder::new(buf)
 }
 
 /// Build the UKMM-specific CBOR wire format from a JSON `Output` struct.
@@ -464,21 +404,23 @@ fn from_json_to_cbor(out: &Output) -> Result<Vec<u8>> {
     // ── Encode the CBOR structure ─────────────────────────────────────────
 
     let mut buf = Vec::with_capacity(65536);
+    let mut enc = make_encoder(&mut buf);
 
     // Outer map: 1 entry (key "Mergeable" → inner map)
-    buf.push(0xA1);
-    cbor_write_text(&mut buf, "Mergeable");
+    enc.map(1).ok();
+    enc.str("Mergeable").ok();
 
     // Inner map: 1 entry (key "MessagePack" → section map)
-    buf.push(0xA1);
-    cbor_write_text(&mut buf, "MessagePack");
+    enc.map(1).ok();
+    enc.str("MessagePack").ok();
 
     // Section map: N entries (section_name → Msyt JSON string)
-    cbor_write_map_header(&mut buf, inner_entries.len());
+    enc.map(inner_entries.len() as u64).ok();
     for (key, value) in &inner_entries {
-        cbor_write_text(&mut buf, key);
-        cbor_write_text(&mut buf, value);
+        enc.str(key).ok();
+        enc.str(value).ok();
     }
+    drop(enc); // release borrow on buf before zstd_compress
 
     eprintln!("zstd compress...");
     let sarc = zstd_compress(&buf)?;
@@ -635,163 +577,114 @@ fn extract_cbor_strings(data: &[u8]) -> Vec<String> {
     /// Maximum string length to process (100 MiB). Anything larger is skipped.
     const MAX_STRING_LEN: usize = 100 * 1024 * 1024;
 
-    // Pre-allocate: typical CBOR blobs have a few dozen strings at most.
     let mut strings = Vec::with_capacity(128);
-    let mut i = 0;
-    while i < data.len() {
-        let b = data[i];
-        // Major type = high 3 bits, additional info = low 5 bits.
-        let mt = (b >> 5) & 0x07;
-        let ai = (b & 0x1f) as usize;
+    let mut dec = minicbor::Decoder::new(data);
+    let _ = extract_strings_inner(&mut dec, &mut strings, MAX_STRING_LEN);
+    strings
+}
 
-        match mt {
-            // ── Major type 2 (byte string) & 3 (text string) ──
-            2 | 3 => {
-                let (sl, adv) = match ai {
-                    0..=23 => (ai, 1),
-                    24 if i + 1 < data.len() => (data[i + 1] as usize, 2),
-                    25 if i + 2 < data.len() => {
-                        (u16::from_be_bytes([data[i + 1], data[i + 2]]) as usize, 3)
-                    }
-                    26 if i + 4 < data.len() => {
-                        let n = u32::from_be_bytes([
-                            data[i + 1],
-                            data[i + 2],
-                            data[i + 3],
-                            data[i + 4],
-                        ]);
-                        (n as usize, 5)
-                    }
-                    27 if i + 8 < data.len() => {
-                        let n = u64::from_be_bytes([
-                            data[i + 1],
-                            data[i + 2],
-                            data[i + 3],
-                            data[i + 4],
-                            data[i + 5],
-                            data[i + 6],
-                            data[i + 7],
-                            data[i + 8],
-                        ]);
-                        // On 32-bit targets, skip strings that don't fit in address space.
-                        #[cfg(target_pointer_width = "32")]
-                        if n > usize::MAX as u64 {
-                            i += 9;
-                            continue;
-                        }
-                        (n as usize, 9)
-                    }
-
-                    // Reserved AI values (28-30): valid CBOR but no defined string encoding.
-                    28..=30 => {
-                        i += 1;
-                        continue;
-                    }
-
-                    // Indefinite-length strings (AI 31): not supported.
-                    31 => {
-                        i += 1;
-                        continue;
-                    }
-                    _ => {
-                        i += 1;
-                        continue;
-                    }
-                };
-
-                if sl > MAX_STRING_LEN {
-                    i += adv;
-                    continue;
-                }
-
-                let str_start = i + adv;
-                let str_end = str_start.saturating_add(sl);
-
-                if str_end <= data.len() {
-                    if let Ok(s) = std::str::from_utf8(&data[str_start..str_end]) {
+/// Recursively walk CBOR data, collecting all text and byte strings.
+fn extract_strings_inner(
+    dec: &mut minicbor::Decoder<'_>,
+    strings: &mut Vec<String>,
+    max_len: usize,
+) -> Result<()> {
+    use minicbor::data::Type;
+    loop {
+        let ty = match dec.datatype() {
+            Ok(ty) => ty,
+            Err(_) => break, // end of input
+        };
+        match ty {
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+                let _ = dec.u64()?;
+            }
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Int => {
+                let _ = dec.i64()?;
+            }
+            Type::F16 => {
+                let _ = dec.f16()?;
+            }
+            Type::F32 => {
+                let _ = dec.f32()?;
+            }
+            Type::F64 => {
+                let _ = dec.f64()?;
+            }
+            Type::Bool => {
+                let _ = dec.bool()?;
+            }
+            Type::Null => {
+                dec.null()?;
+            }
+            Type::Undefined => {
+                dec.undefined()?;
+            }
+            Type::Simple => {
+                let _ = dec.simple()?;
+            }
+            Type::Bytes | Type::BytesIndef => {
+                let raw = dec.bytes()?;
+                if !raw.is_empty() && raw.len() <= max_len {
+                    if let Ok(s) = std::str::from_utf8(raw) {
                         if !s.is_empty() {
                             strings.push(s.to_string());
                         }
                     }
                 }
-
-                i = str_end.min(data.len());
-                continue;
             }
-
-            // ── Major types 4 (array) & 5 (map) ──
-            // Skip the header bytes so we don't treat contained items as top-level strings.
-            4 | 5 => {
-                let extra = match ai {
-                    0..=23 => 0,
-                    24 => 1,
-                    25 => 2,
-                    26 => 4,
-                    27 => 8,
-                    // Reserved / indefinite-length containers.
-                    28..=31 => {
-                        i += 1;
-                        continue;
+            Type::String | Type::StringIndef => {
+                let s = dec.str()?;
+                if !s.is_empty() && s.len() <= max_len {
+                    strings.push(s.to_string());
+                }
+            }
+            Type::Array | Type::ArrayIndef => {
+                let len = dec.array()?;
+                if let Some(n) = len {
+                    for _ in 0..n {
+                        extract_strings_inner(dec, strings, max_len)?;
                     }
-                    _ => {
-                        i += 1;
-                        continue;
+                } else {
+                    loop {
+                        match dec.datatype() {
+                            Err(_) | Ok(Type::Break) => break,
+                            _ => {
+                                extract_strings_inner(dec, strings, max_len)?;
+                            }
+                        }
                     }
-                };
-                i += 1 + extra;
-                continue;
+                    let _ = dec.skip();
+                }
             }
-
-            // ── Major type 6 (tag) ──
-            6 => {
-                let extra = match ai {
-                    0..=23 => 0,
-                    24 => 1,
-                    25 => 2,
-                    26 => 4,
-                    27 => 8,
-                    _ => 0,
-                };
-                i += 1 + extra;
-                continue;
+            Type::Map | Type::MapIndef => {
+                let len = dec.map()?;
+                if let Some(n) = len {
+                    for _ in 0..n {
+                        extract_strings_inner(dec, strings, max_len)?;
+                        extract_strings_inner(dec, strings, max_len)?;
+                    }
+                } else {
+                    loop {
+                        match dec.datatype() {
+                            Err(_) | Ok(Type::Break) => break,
+                            _ => {
+                                extract_strings_inner(dec, strings, max_len)?;
+                            }
+                        }
+                    }
+                    let _ = dec.skip();
+                }
             }
-
-            // ── Major type 7 (float / simple / break) ──
-            7 => {
-                let extra = match ai {
-                    0..=23 => 0,  // simple value
-                    24 => 1,      // 1-byte simple
-                    25 => 2,      // half-precision float
-                    26 => 4,      // single-precision float
-                    27 => 8,      // double-precision float
-                    28..=31 => 0, // stop/break/indefinite
-                    _ => 0,
-                };
-                i += 1 + extra;
-                continue;
+            Type::Tag => {
+                let _ = dec.tag()?;
             }
-
-            // ── Major type 0 (uint) & 1 (negative int) ──
-            0 | 1 => {
-                let extra = match ai {
-                    0..=23 => 0,
-                    24 => 1,
-                    25 => 2,
-                    26 => 4,
-                    27 => 8,
-                    _ => 0,
-                };
-                i += 1 + extra;
-                continue;
-            }
-
-            _ => {
-                i += 1;
-                continue;
+            Type::Break | Type::Unknown(_) => {
+                let _ = dec.skip();
             }
         }
     }
-    strings
+    Ok(())
 }
 
 /// Parse a CBOR-encoded UKMM message blob into an `Output` struct.
@@ -1526,46 +1419,58 @@ fn run_interactive() -> Result<()> {
         anyhow::bail!("No UKMM resource files found in the mod.");
     }
 
-    for file in &resource_files {
-        let file_path = file.display().to_string();
-        let relative = file.strip_prefix(&extract_dir).unwrap_or(file);
-        let stem = filename_stem(file);
-        let ext = file.extension().and_then(|x| x.to_str()).unwrap_or("");
+    // Process files in parallel. Each file maps to its own output; no shared state.
+    let results: Vec<Result<()>> = resource_files
+        .par_iter()
+        .map(|file| -> Result<()> {
+            let file_path = file.display().to_string();
+            let relative = file.strip_prefix(&extract_dir).unwrap_or(file);
+            let stem = filename_stem(file);
+            let ext = file.extension().and_then(|x| x.to_str()).unwrap_or("");
 
-        // Message SARCs: process through convert_file with SARC → structured YAML
-        if stem.starts_with("Msg_") && ext.ends_with("arc") {
-            let output_path = mods_out_dir.join(relative).with_extension("yaml");
-            if let Some(parent) = output_path.parent() {
-                fs::create_dir_all(parent)?;
+            // Message SARCs: process through convert_file with SARC → structured YAML
+            if stem.starts_with("Msg_") && ext.ends_with("arc") {
+                let output_path = mods_out_dir.join(relative).with_extension("yaml");
+                if let Some(parent) = output_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                write_output(&convert_file(&file_path)?, &output_path)?;
+                return Ok(());
             }
-            write_output(&convert_file(&file_path)?, &output_path)?;
-            continue;
-        }
 
-        // Use dispatch_extract for the standard format pipeline.
-        let out = match convert_file(&file_path) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("  ⚠ Skipping {}: {e}", file.display());
-                continue;
-            }
-        };
-        let parent_dir = mods_out_dir
-            .join(relative)
-            .parent()
-            .unwrap_or(&mods_out_dir)
-            .to_path_buf();
-        fs::create_dir_all(&parent_dir)?;
+            // Use dispatch_extract for the standard format pipeline.
+            let out = match convert_file(&file_path) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("  ⚠ Skipping {}: {e}", file.display());
+                    return Ok(());
+                }
+            };
+            let parent_dir = mods_out_dir
+                .join(relative)
+                .parent()
+                .unwrap_or(&mods_out_dir)
+                .to_path_buf();
+            fs::create_dir_all(&parent_dir)?;
 
-        let output_path = mods_out_dir.join(relative).with_extension(extract_extension(&out));
-        match dispatch_extract(&out)? {
-            Some(bytes) => {
-                fs::write(&output_path, &bytes)?;
-                eprintln!("  ✓ Converted to native BYML: {}", output_path.display());
+            let output_path = mods_out_dir.join(relative).with_extension(extract_extension(&out));
+            match dispatch_extract(&out)? {
+                Some(bytes) => {
+                    fs::write(&output_path, &bytes)?;
+                    eprintln!("  ✓ Converted to native BYML: {}", output_path.display());
+                }
+                None => {
+                    write_output(&out, &output_path)?;
+                }
             }
-            None => {
-                write_output(&out, &output_path)?;
-            }
+            Ok(())
+        })
+        .collect();
+
+    // Propagate first error if any.
+    for r in &results {
+        if let Err(e) = r {
+            anyhow::bail!("{}", e);
         }
     }
 
@@ -2305,156 +2210,142 @@ fn looks_like_binary_cbor(d: &[u8]) -> bool {
 ///
 /// Handles all major types needed for UKMM Mergeable structures:
 /// uint, nint, bytes (→ base64 JSON string), text, array, map, tag, float.
+/// Uses `minicbor::Decoder` for all CBOR type/length parsing.
 fn cbor_to_json(data: &[u8], offset: &mut usize) -> Result<serde_json::Value> {
-    if *offset >= data.len() {
-        anyhow::bail!("Unexpected end of CBOR data at offset {offset}");
-    }
-    let b = data[*offset];
-    let mt = (b >> 5) & 0x07;
-    let ai = (b & 0x1f) as usize;
-    *offset += 1;
+    let mut dec = minicbor::Decoder::new(&data[*offset..]);
+    let val = decode_value(&mut dec)?;
+    *offset = data.len() - dec.input().len();
+    Ok(val)
+}
 
-    let (value, _adv) = match ai {
-        0..=23 => (ai as u64, 0),
-        24 if *offset < data.len() => {
-            let v = data[*offset] as u64;
-            *offset += 1;
-            (v, 0)
+/// Internal recursive decoder using minicbor::Decoder.
+fn decode_value(dec: &mut minicbor::Decoder<'_>) -> Result<serde_json::Value> {
+    use minicbor::data::Type;
+    match dec.datatype()? {
+        Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+            let n = dec.u64()?;
+            Ok(serde_json::Value::Number(n.into()))
         }
-        25 if *offset + 2 <= data.len() => {
-            let v = u16::from_be_bytes([data[*offset], data[*offset + 1]]) as u64;
-            *offset += 2;
-            (v, 0)
+        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Int => {
+            let n = dec.i64()?;
+            Ok(serde_json::Value::Number(serde_json::Number::from(n)))
         }
-        26 if *offset + 4 <= data.len() => {
-            let v = u32::from_be_bytes([
-                data[*offset],
-                data[*offset + 1],
-                data[*offset + 2],
-                data[*offset + 3],
-            ]) as u64;
-            *offset += 4;
-            (v, 0)
+        Type::F16 => {
+            let n = dec.f16()?;
+            serde_json::Number::from_f64(n as f64)
+                .map(serde_json::Value::Number)
+                .context("CBOR f16 out of range")
         }
-        27 if *offset + 8 <= data.len() => {
-            let v = u64::from_be_bytes([
-                data[*offset],
-                data[*offset + 1],
-                data[*offset + 2],
-                data[*offset + 3],
-                data[*offset + 4],
-                data[*offset + 5],
-                data[*offset + 6],
-                data[*offset + 7],
-            ]);
-            *offset += 8;
-            (v, 0)
+        Type::F32 => {
+            let n = dec.f32()?;
+            serde_json::Number::from_f64(n as f64)
+                .map(serde_json::Value::Number)
+                .context("CBOR f32 out of range")
         }
-        28..=31 => anyhow::bail!(
-            "Unsupported CBOR additional info {ai} at offset {}",
-            *offset - 1
-        ),
-        _ => anyhow::bail!("Invalid CBOR additional info {ai}"),
-    };
-
-    match mt {
-        0 => Ok(serde_json::Value::Number(value.into())), // uint
-        1 => Ok(serde_json::Value::Number(
-            // nint
-            serde_json::Number::from(-(value as i64) - 1),
-        )),
-        2 => {
-            // bytes → base64 string with marker prefix for reliable round-trip.
-            // The \x01 prefix lets json_to_cbor distinguish byte strings from
-            // regular text strings that happen to look like valid base64.
-            let end = offset.saturating_add(value as usize);
-            if end > data.len() {
-                anyhow::bail!("CBOR byte string out of bounds");
-            }
-            let s = data[*offset..end].to_vec();
-            *offset = end;
+        Type::F64 => {
+            let n = dec.f64()?;
+            serde_json::Number::from_f64(n)
+                .map(serde_json::Value::Number)
+                .context("CBOR f64 out of range")
+        }
+        Type::Bool => Ok(serde_json::Value::Bool(dec.bool()?)),
+        Type::Null => {
+            dec.null()?;
+            Ok(serde_json::Value::Null)
+        }
+        Type::Undefined => {
+            dec.undefined()?;
+            Ok(serde_json::Value::Null)
+        }
+        Type::Simple => {
+            dec.simple()?;
+            Ok(serde_json::Value::Null)
+        }
+        Type::Bytes | Type::BytesIndef => {
+            let raw = dec.bytes()?;
             Ok(serde_json::Value::String(format!(
                 "\x01{}",
-                base64_encode(&s)
+                base64_encode(raw)
             )))
         }
-        3 => {
-            // text
-            let end = offset.saturating_add(value as usize);
-            if end > data.len() {
-                anyhow::bail!(
-                    "CBOR text string out of bounds at offset {} len {value}",
-                    *offset
-                );
-            }
-            let slice = &data[*offset..end];
-            let s = match std::str::from_utf8(slice) {
-                Ok(s) => s.to_string(),
-                Err(e) => {
-                    let pos = *offset;
-                    anyhow::bail!("CBOR text string is not valid UTF-8 at offset {pos}: {e}");
-                }
-            };
-            *offset = end;
-            Ok(serde_json::Value::String(s))
+        Type::String | Type::StringIndef => {
+            let s = dec.str()?;
+            Ok(serde_json::Value::String(s.to_string()))
         }
-        4 => {
-            // array
-            let mut arr = Vec::with_capacity(value as usize);
-            for _ in 0..value {
-                arr.push(cbor_to_json(data, offset)?);
+        Type::Array | Type::ArrayIndef => {
+            let len = dec.array()?;
+            let cap = len.unwrap_or(4).min(4096) as usize;
+            let mut arr = Vec::with_capacity(cap);
+            if let Some(n) = len {
+                for _ in 0..n {
+                    arr.push(decode_value(dec)?);
+                }
+            } else {
+                loop {
+                    match dec.datatype() {
+                        Err(_) | Ok(Type::Break) => break,
+                        _ => {
+                            arr.push(decode_value(dec)?);
+                        }
+                    }
+                }
+                // Consume the break marker.
+                let _ = dec.skip();
             }
             Ok(serde_json::Value::Array(arr))
         }
-        5 => {
-            // map
-            let mut map = serde_json::Map::with_capacity(value as usize);
-            for _ in 0..value {
-                let k = cbor_to_json(data, offset)?;
-                let v = cbor_to_json(data, offset)?;
-                // Key must be a string for JSON objects
-                let key = match &k {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                map.insert(key, v);
+        Type::Map | Type::MapIndef => {
+            let len = dec.map()?;
+            let cap = len.unwrap_or(4).min(4096) as usize;
+            let mut map = serde_json::Map::with_capacity(cap);
+            if let Some(n) = len {
+                for _ in 0..n {
+                    let k = decode_value(dec)?;
+                    let v = decode_value(dec)?;
+                    let key = match &k {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    map.insert(key, v);
+                }
+            } else {
+                loop {
+                    match dec.datatype() {
+                        Err(_) | Ok(Type::Break) => break,
+                        _ => {
+                            let k = decode_value(dec)?;
+                            let v = decode_value(dec)?;
+                            let key = match &k {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            map.insert(key, v);
+                        }
+                    }
+                }
+                // Consume the break marker.
+                let _ = dec.skip();
             }
             Ok(serde_json::Value::Object(map))
         }
-        6 => {
-            // tag: skip tag, decode next
-            cbor_to_json(data, offset)
+        Type::Tag => {
+            dec.tag()?;
+            decode_value(dec)
         }
-        7 => {
-            // float / simple
-            // NOTE: the float data bytes have ALREADY been consumed by the initial
-            // AI/value parsing above (ai 25/26/27 read 2/4/8 bytes and advance *offset).
-            // We must NOT read them again — use `value` instead.
-            let float_val: f64 = match ai {
-                // Simple values (false=20, true=21, null=22, undefined=23)
-                20 => return Ok(serde_json::Value::Bool(false)),
-                21 => return Ok(serde_json::Value::Bool(true)),
-                22 | 23 => return Ok(serde_json::Value::Null),
-                // 1-byte simple (AI 24) — value is the simple type, used for
-                // extended simple values (e.g. 0xF8 + byte). We just return null.
-                24 => return Ok(serde_json::Value::Null),
-                // f16: value was decoded as u16 from the initial parsing
-                25 => f16_to_f64(value as u16),
-                // f32: value was decoded as u32 from the initial parsing
-                26 => f32::from_bits(value as u32) as f64,
-                // f64: value was decoded as u64 from the initial parsing
-                27 => f64::from_bits(value),
-                _ => return Ok(serde_json::Value::Null),
-            };
-            serde_json::Number::from_f64(float_val)
-                .map(serde_json::Value::Number)
-                .ok_or_else(|| anyhow::anyhow!("CBOR float value out of range"))
+        Type::Break => {
+            // Should not reach here in normal data; return null.
+            Ok(serde_json::Value::Null)
         }
-        _ => anyhow::bail!("Unknown CBOR major type {mt}"),
+        Type::Unknown(_) => {
+            // Unknown/invalid CBOR type; skip the byte and return null.
+            let _ = dec.skip();
+            Ok(serde_json::Value::Null)
+        }
     }
 }
 
 /// Convert an f16 (half-precision) bit pattern to f64.
+#[allow(dead_code)]
 fn f16_to_f64(bits: u16) -> f64 {
     let sign = ((bits >> 15) as f64) * -2.0 + 1.0;
     let exp = (bits >> 10) & 0x1f;
@@ -2517,22 +2408,24 @@ fn looks_like_base64(s: &str) -> bool {
 /// Recursively encode a `serde_json::Value` as CBOR bytes.
 fn json_to_cbor(val: &serde_json::Value, buf: &mut Vec<u8>) {
     match val {
-        serde_json::Value::Null => buf.push(0xF6),
-        serde_json::Value::Bool(b) => buf.push(if *b { 0xF5 } else { 0xF4 }),
+        serde_json::Value::Null => {
+            let _ = make_encoder(buf).null();
+        }
+        serde_json::Value::Bool(b) => {
+            let _ = make_encoder(buf).bool(*b);
+        }
         serde_json::Value::Number(n) => {
             if let Some(v) = n.as_u64() {
-                cbor_write_uint(buf, 0, v); // major type 0
+                let _ = make_encoder(buf).u64(v);
             } else if let Some(v) = n.as_i64() {
                 if v >= 0 {
-                    cbor_write_uint(buf, 0, v as u64);
+                    let _ = make_encoder(buf).u64(v as u64);
                 } else {
-                    cbor_write_uint(buf, 1, (-1 - v) as u64); // major type 1
+                    let _ = make_encoder(buf).i64(v);
                 }
             } else if let Some(v) = n.as_f64() {
                 // UKMM CBOR format uses f32 for all float values.
-                // Using f64 would cause "unexpected type f64 at position …: expected f32".
-                buf.push(0xFA); // f32
-                buf.extend_from_slice(&(v as f32).to_bits().to_be_bytes());
+                let _ = make_encoder(buf).f32(v as f32);
             }
         }
         serde_json::Value::String(s) => {
@@ -2542,52 +2435,34 @@ fn json_to_cbor(val: &serde_json::Value, buf: &mut Vec<u8>) {
             // All other strings are written as CBOR text (major type 3).
             if let Some(b64) = s.strip_prefix('\x01') {
                 match base64_decode(b64) {
-                    Ok(bytes) => cbor_write_bytes(buf, &bytes),
-                    Err(_) => cbor_write_text(buf, s), // fallback: write as-is
+                    Ok(bytes) => {
+                        let _ = make_encoder(buf).bytes(&bytes);
+                    }
+                    Err(_) => {
+                        let _ = make_encoder(buf).str(s);
+                    }
                 }
             } else {
-                cbor_write_text(buf, s);
+                let _ = make_encoder(buf).str(s);
             }
         }
         serde_json::Value::Array(arr) => {
-            cbor_write_uint(buf, 4, arr.len() as u64); // major type 4
+            let _ = make_encoder(buf).array(arr.len() as u64);
             for item in arr {
                 json_to_cbor(item, buf);
             }
         }
         serde_json::Value::Object(map) => {
-            cbor_write_uint(buf, 5, map.len() as u64); // major type 5
+            let _ = make_encoder(buf).map(map.len() as u64);
             for (k, v) in map {
-                cbor_write_text(buf, k);
+                let _ = make_encoder(buf).str(k);
                 json_to_cbor(v, buf);
             }
         }
     }
 }
 
-/// Write a CBOR uint/nint/array/map header with the given major type and value.
-fn cbor_write_uint(buf: &mut Vec<u8>, major_type: u8, value: u64) {
-    let mt = major_type << 5;
-    match value {
-        0..=23 => buf.push(mt | value as u8),
-        24..=0xFF => {
-            buf.push(mt | 24);
-            buf.push(value as u8);
-        }
-        0x100..=0xFFFF => {
-            buf.push(mt | 25);
-            buf.extend_from_slice(&(value as u16).to_be_bytes());
-        }
-        0x10000..=0xFFFF_FFFF => {
-            buf.push(mt | 26);
-            buf.extend_from_slice(&(value as u32).to_be_bytes());
-        }
-        _ => {
-            buf.push(mt | 27);
-            buf.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-}
+
 
 /// Parse a UKMM "Mergeable" / "ActorInfo" CBOR blob into an `Output`.
 ///
@@ -2643,19 +2518,25 @@ fn rebuild_actorinfo_from_output(out: &Output) -> Result<Vec<u8>> {
                     // Write CBOR directly with u32 integer keys for hashes.
                     // json_to_cbor would encode all object keys as text strings,
                     // but UKMM expects the hash keys as CBOR unsigned integers.
+                    // So we write the structure manually, using json_to_cbor for
+                    // the values and a short-lived Encoder for the keys.
                     let mut buf = Vec::with_capacity(65536);
                     // { "Mergeable": { "ActorInfo": { u32_hash: value, ... } } }
-                    cbor_write_uint(&mut buf, 5, 1); // outer map: 1 entry
-                    cbor_write_text(&mut buf, "Mergeable");
-                    cbor_write_uint(&mut buf, 5, 1); // inner map: 1 entry
-                    cbor_write_text(&mut buf, "ActorInfo");
-                    cbor_write_uint(&mut buf, 5, actor_map.len() as u64);
+                    let mut enc = make_encoder(&mut buf);
+                    enc.map(1).ok();   // outer map: 1 entry
+                    enc.str("Mergeable").ok();
+                    enc.map(1).ok();   // inner map: 1 entry
+                    enc.str("ActorInfo").ok();
+                    enc.map(actor_map.len() as u64).ok();
+                    drop(enc); // release borrow so json_to_cbor can use buf
+
                     for (hash_str, value) in &actor_map {
                         let hash: u64 = hash_str
                             .parse()
                             .with_context(|| format!("Invalid ActorInfo hash key: {hash_str}"))?;
-                        cbor_write_uint(&mut buf, 0, hash); // u32 key
-                        json_to_cbor(value, &mut buf); // value via standard CBOR
+                        // Write u32 hash key via a temporary Encoder.
+                        make_encoder(&mut buf).u64(hash).ok();
+                        json_to_cbor(value, &mut buf);
                     }
                     return Ok(buf);
                 }
@@ -3125,7 +3006,7 @@ mod tests {
     #[test]
     fn test_cbor_write_text_short() {
         let mut buf = Vec::new();
-        cbor_write_text(&mut buf, "hello");
+        make_encoder(&mut buf).str("hello").ok();
         // 0x65 = 0x60 | 5 (length)
         assert_eq!(buf, [0x65, b'h', b'e', b'l', b'l', b'o']);
     }
@@ -3135,7 +3016,7 @@ mod tests {
     fn test_cbor_write_text_24_byte() {
         let s = "a".repeat(24);
         let mut buf = Vec::new();
-        cbor_write_text(&mut buf, &s);
+        make_encoder(&mut buf).str(&s).ok();
         // 0x78 = text with 1-byte length prefix.
         assert_eq!(buf[0], 0x78);
         assert_eq!(buf[1], 24);
@@ -3147,7 +3028,7 @@ mod tests {
     fn test_cbor_write_text_256_byte() {
         let s = "b".repeat(256);
         let mut buf = Vec::new();
-        cbor_write_text(&mut buf, &s);
+        make_encoder(&mut buf).str(&s).ok();
         // 0x79 = text with 2-byte length prefix.
         assert_eq!(buf[0], 0x79);
         assert_eq!(buf[1], 0x01); // 256 big-endian high byte
@@ -3160,7 +3041,7 @@ mod tests {
     fn test_cbor_write_text_u32() {
         let s = "c".repeat(70_000);
         let mut buf = Vec::new();
-        cbor_write_text(&mut buf, &s);
+        make_encoder(&mut buf).str(&s).ok();
         // 0x7A = text with 4-byte length prefix.
         assert_eq!(buf[0], 0x7A);
         let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
@@ -3171,7 +3052,7 @@ mod tests {
     #[test]
     fn test_cbor_write_map_header_small() {
         let mut buf = Vec::new();
-        cbor_write_map_header(&mut buf, 3);
+        make_encoder(&mut buf).map(3).ok();
         assert_eq!(buf, [0xA3]); // 0xA0 | 3
     }
 
@@ -3179,7 +3060,7 @@ mod tests {
     #[test]
     fn test_cbor_write_map_header_u8() {
         let mut buf = Vec::new();
-        cbor_write_map_header(&mut buf, 100);
+        make_encoder(&mut buf).map(100).ok();
         // 0xB8 = map with 1-byte length prefix.
         assert_eq!(buf, [0xB8, 100]);
     }
@@ -3188,7 +3069,7 @@ mod tests {
     #[test]
     fn test_cbor_write_map_header_u16() {
         let mut buf = Vec::new();
-        cbor_write_map_header(&mut buf, 500);
+        make_encoder(&mut buf).map(500).ok();
         // 0xB9 = map with 2-byte length prefix, 0x01F4 = 500.
         assert_eq!(buf, [0xB9, 0x01, 0xF4]);
     }
@@ -3197,7 +3078,7 @@ mod tests {
     #[test]
     fn test_cbor_write_map_header_u32() {
         let mut buf = Vec::new();
-        cbor_write_map_header(&mut buf, 100_000);
+        make_encoder(&mut buf).map(100_000).ok();
         // 0xBA = map with 4-byte length prefix, 0x000186A0 = 100_000.
         assert_eq!(buf, [0xBA, 0x00, 0x01, 0x86, 0xA0]);
     }
@@ -3305,7 +3186,7 @@ mod tests {
         let inputs = ["a", "hello", &s24, &s300];
         for s in inputs {
             let mut buf = Vec::new();
-            cbor_write_text(&mut buf, s);
+            make_encoder(&mut buf).str(s).ok();
             let strings = extract_cbor_strings(&buf);
             assert_eq!(
                 strings,
@@ -3656,16 +3537,17 @@ mod tests {
         let test_data: Vec<u8> = (0..100).collect();
 
         // Build CBOR: { "Binary": [0, 1, 2, ..., 99] }
-        // Use proper CBOR uint encoding for each byte value (values >= 24
-        // need a length prefix, not raw bytes).
         let mut original = vec![
             0xA1, // map(1)
             0x66, b'B', b'i', b'n', b'a', b'r', b'y', // text(6) "Binary"
         ];
         // Array header for 100 entries
-        cbor_write_uint(&mut original, 4, test_data.len() as u64);
-        for &b in &test_data {
-            cbor_write_uint(&mut original, 0, b as u64); // proper CBOR uint
+        {
+            let mut enc = make_encoder(&mut original);
+            enc.array(test_data.len() as u64).ok();
+            for &b in &test_data {
+                enc.u64(b as u64).ok();
+            }
         }
 
         // Parse
@@ -3696,7 +3578,7 @@ mod tests {
 
         // Write CBOR byte string
         let mut buf = Vec::new();
-        cbor_write_bytes(&mut buf, &original_bytes);
+        make_encoder(&mut buf).bytes(&original_bytes).ok();
 
         // Decode with cbor_to_json → should become \x01-prefixed base64 string
         let json_val = cbor_to_json(&buf, &mut 0).unwrap();

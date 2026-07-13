@@ -19,6 +19,8 @@ serde_yaml = "0.9"
 zip = "2"
 zstd = { version = "0.13.3", features = ["experimental"] }
 atty = "0.2"
+minicbor = { version = "0.25.0", features = ["alloc", "full", "std"] }
+rayon = "1.12.0"
 
 [dev-dependencies]
 criterion = "0.8.2"
