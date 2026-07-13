@@ -145,13 +145,6 @@ struct Output {
 }
 
 /// Direction of conversion: extract (file → YAML/BYML) or rebuild (YAML/BYML → file).
-#[derive(Clone, Copy, PartialEq)]
-#[allow(dead_code)]
-enum Direction {
-    Extract,
-    Rebuild,
-}
-
 /// Extension to use for a given format in extract direction.
 fn extract_extension(out: &Output) -> &'static str {
     match out.format.as_deref() {
@@ -212,9 +205,7 @@ fn dispatch_extract(out: &Output) -> Result<Option<Vec<u8>>> {
             }
             Ok(None)
         }
-        Some("SarcMap") | Some("Binary") => Ok(None), // YAML fallback
-        Some("AAMP") => Ok(None), // YAML fallback
-        _ => Ok(None), // YAML fallback
+        _ => Ok(None) // YAML fallback
     }
 }
 
@@ -301,16 +292,7 @@ fn zstd_compress(data: &[u8]) -> Result<Vec<u8>> {
     // Fallback: dictionary-less zstd at level 8.
     zstd::encode_all(data, 8).context("zstd compress failed")
 }
-
-/// Encode a UTF-8 string into CBOR text (major type 3).
-///
-/// Supports all five CBOR length encodings:
-/// - 0..=23: inline (0x60 | len)
-/// - 24..=255: 0x78 + 1-byte length
-/// - 256..=65535: 0x79 + 2-byte big-endian length
-/// - 65536..=0xFFFFFFFF: 0x7A + 4-byte big-endian length
-/// - >0xFFFFFFFF: 0x7B + 8-byte big-endian length
-/// Helper: create a minicbor Encoder writing to a Vec<u8>.
+/// Create a minicbor Encoder writing to a Vec<u8>.
 fn make_encoder(buf: &mut Vec<u8>) -> minicbor::Encoder<&mut Vec<u8>> {
     minicbor::Encoder::new(buf)
 }
@@ -365,24 +347,32 @@ fn from_json_to_cbor(out: &Output) -> Result<Vec<u8>> {
     }
 
     // Validate each section name for length and safety.
+    // Note: section_name is only used as a CBOR map key for UKMM's internal
+    // message-file parser — it never touches the filesystem. The `..` and
+    // leading-slash checks are defense-in-depth against malformed input JSON.
     for section_name in out.entries.keys() {
         if section_name.is_empty() {
             anyhow::bail!("Output contains an empty section name — refusing to produce CBOR");
         }
         if section_name.len() > 512 {
+            // 512 is a generous ceiling for CBOR key lengths;
+            // no spec-derived limit exists for UKMM section names.
             anyhow::bail!(
                 "Section name '{section_name}' is too long ({} chars) — refusing to produce CBOR",
                 section_name.len()
             );
         }
-        if section_name.contains("..") {
+        if let Some(c) = section_name
+            .chars()
+            .find(|c| c.is_control() || *c == '\u{FEFF}')
+        {
             anyhow::bail!(
-                "Section name '{section_name}' contains '..' (path traversal) — refusing to produce CBOR"
+                "Section name '{section_name:?}' contains an invalid character ({c:?}) — refusing to produce CBOR"
             );
         }
-        if section_name.chars().any(|c| c.is_control()) {
+        if section_name.contains("..") || section_name.starts_with(['/', '\\']) {
             anyhow::bail!(
-                "Section name '{section_name:?}' contains control characters — refusing to produce CBOR"
+                "Section name '{section_name}' contains suspicious patterns ('..' or leading slash) — likely malformed input"
             );
         }
     }
@@ -404,25 +394,25 @@ fn from_json_to_cbor(out: &Output) -> Result<Vec<u8>> {
     // ── Encode the CBOR structure ─────────────────────────────────────────
 
     let mut buf = Vec::with_capacity(65536);
-    let mut enc = make_encoder(&mut buf);
+    {
+        let mut enc = make_encoder(&mut buf);
 
-    // Outer map: 1 entry (key "Mergeable" → inner map)
-    enc.map(1).ok();
-    enc.str("Mergeable").ok();
+        // Outer map: 1 entry (key "Mergeable" → inner map)
+        enc.map(1).ok();
+        enc.str("Mergeable").ok();
 
-    // Inner map: 1 entry (key "MessagePack" → section map)
-    enc.map(1).ok();
-    enc.str("MessagePack").ok();
+        // Inner map: 1 entry (key "MessagePack" → section map)
+        enc.map(1).ok();
+        enc.str("MessagePack").ok();
 
-    // Section map: N entries (section_name → Msyt JSON string)
-    enc.map(inner_entries.len() as u64).ok();
-    for (key, value) in &inner_entries {
-        enc.str(key).ok();
-        enc.str(value).ok();
-    }
-    drop(enc); // release borrow on buf before zstd_compress
+        // Section map: N entries (section_name → Msyt JSON string)
+        enc.map(inner_entries.len() as u64).ok();
+        for (key, value) in &inner_entries {
+            enc.str(key).ok();
+            enc.str(value).ok();
+        }
+    } // enc dropped here, releasing borrow on buf
 
-    eprintln!("zstd compress...");
     let sarc = zstd_compress(&buf)?;
     Ok(sarc)
 }
@@ -437,19 +427,16 @@ fn from_json_to_cbor(out: &Output) -> Result<Vec<u8>> {
 ///   zstd-compressed → Yaz0 archive → SARC or CBOR inside.
 fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     let d = if data.len() > 4 && data[0..4] == ZSTD_MAGIC {
-        eprintln!("zstd...");
         zstd_decompress(data)?
     } else {
         // Check for direct yaz0 (non-zstd-wrapped) — common for raw .bshop files.
         if data.len() > 4 && data[0..4] == *b"Yaz0" {
-            eprintln!("yaz0...");
             return Ok(roead::yaz0::decompress(data)?);
         }
         return Ok(data.to_vec());
     };
     // Check for yaz0 inside zstd
     if d.len() > 4 && d[0..4] == *b"Yaz0" {
-        eprintln!("yaz0...");
         return Ok(roead::yaz0::decompress(&d)?);
     }
     Ok(d)
@@ -1301,7 +1288,7 @@ fn run_interactive() -> Result<()> {
             } else if path.extension().is_some_and(|e| e == "zip") {
                 let display =
                     read_zip_meta_name(&path).unwrap_or_else(|| filename_stem(&path));
-                // Only show mods with meta.yml (filter loose zip files)
+                // Only show mods with meta.yml and valid names
                 if !display.is_empty() && display != filename_stem(&path) {
                     mods.push(ModEntry {
                         display_name: display,
@@ -1309,16 +1296,6 @@ fn run_interactive() -> Result<()> {
                         is_dir: false,
                     });
                 }
-            } else if path.extension().is_some_and(|e| e == "zip") {
-                // Fallback: accept any ZIP it's an UKMM mod
-                // Accept any ZIP with meta.yml (even without known resource extensions).
-                let display =
-                    read_zip_meta_name(&path).unwrap_or_else(|| filename_stem(&path));
-                mods.push(ModEntry {
-                    display_name: display,
-                    path,
-                    is_dir: false,
-                });
             }
         }
     }
@@ -1564,17 +1541,13 @@ fn run_rebuild(
             // Check if this is a mergeable .sbyml (not ActorInfo BYML).
             // Mergeable BYML has a single Map key with serde-tagged values;
             // ActorInfo BYML has "Actors" and "Hashes" arrays.
+            // Non-map BYML (scalar/array/string) is NOT mergeable.
             let is_mergeable = match roead::byml::Byml::from_binary(&data) {
-                Ok(byml) => {
-                    if let Ok(map) = byml.as_map() {
-                        // If it has Actors/Hashes arrays, it's ActorInfo BYML.
-                        let has_actors = map.contains_key("Actors");
-                        let has_hashes = map.contains_key("Hashes");
-                        !has_actors && !has_hashes
-                    } else {
-                        true
-                    }
-                }
+                Ok(byml) => byml.as_map().is_ok_and(|map| {
+                    let has_actors = map.contains_key("Actors");
+                    let has_hashes = map.contains_key("Hashes");
+                    !has_actors && !has_hashes
+                }),
                 Err(_) => false,
             };
 
@@ -1739,23 +1712,14 @@ fn run_rebuild(
         let mut archive = zip::ZipArchive::new(zip_file)?;
         archive.extract(&temp_extract)?;
         // Remove old contents and copy new ones.
-        for entry in fs::read_dir(mod_path)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(entry.path())?;
-            } else {
-                fs::remove_file(entry.path())?;
-            }
-        }
+        clear_dir_contents(mod_path)?;
         copy_dir_all(&temp_extract, mod_path)?;
         fs::remove_dir_all(&temp_extract)?;
         println!("  ✓ Extracted to UKMM directory: {}", mod_path.display());
     }
 
     // ── Remove the intermediate modified .zip from the output directory ──
-    if modified_path.exists() {
-        fs::remove_file(&modified_path)?;
-    }
+    let _ = fs::remove_file(&modified_path);
 
     println!("\nDone!\n");
 
@@ -1788,14 +1752,7 @@ fn run_restore(mod_name: &str, mods_out_dir: &Path, mod_path: &Path, is_dir: boo
         let zip_file = fs::File::open(&backup_path)?;
         let mut archive = zip::ZipArchive::new(zip_file)?;
         archive.extract(&temp_extract)?;
-        for entry in fs::read_dir(mod_path)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(entry.path())?;
-            } else {
-                fs::remove_file(entry.path())?;
-            }
-        }
+        clear_dir_contents(mod_path)?;
         copy_dir_all(&temp_extract, mod_path)?;
         fs::remove_dir_all(&temp_extract)?;
         println!("  ✓ Restored to UKMM directory: {}", mod_path.display());
@@ -1892,10 +1849,10 @@ fn byml_to_value(data: &[u8]) -> Result<serde_json::Value> {
 }
 
 /// Convert a `serde_json::Value` back to BYML binary bytes (big-endian, Wii U format).
-fn value_to_byml(val: &serde_json::Value) -> Result<Vec<u8>> {
+fn value_to_byml(val: serde_json::Value) -> Result<Vec<u8>> {
     use roead::byml::Byml;
     let byml: Byml =
-        serde_json::from_value(val.clone()).context("Failed to deserialize JSON to BYML")?;
+        serde_json::from_value(val).context("Failed to deserialize JSON to BYML")?;
     Ok(byml.to_binary(roead::Endian::Big))
 }
 
@@ -1938,7 +1895,7 @@ fn rebuild_byml_from_output(out: &Output) -> Result<Vec<u8>> {
                 if let Some(json_text) = entry.get("attributes").and_then(|a| a.as_str()) {
                     let val: serde_json::Value = serde_json::from_str(json_text)
                         .context("Failed to parse BYML JSON content")?;
-                    return value_to_byml(&val);
+                    return value_to_byml(val);
                 }
             }
         }
@@ -2522,13 +2479,14 @@ fn rebuild_actorinfo_from_output(out: &Output) -> Result<Vec<u8>> {
                     // the values and a short-lived Encoder for the keys.
                     let mut buf = Vec::with_capacity(65536);
                     // { "Mergeable": { "ActorInfo": { u32_hash: value, ... } } }
-                    let mut enc = make_encoder(&mut buf);
-                    enc.map(1).ok();   // outer map: 1 entry
-                    enc.str("Mergeable").ok();
-                    enc.map(1).ok();   // inner map: 1 entry
-                    enc.str("ActorInfo").ok();
-                    enc.map(actor_map.len() as u64).ok();
-                    drop(enc); // release borrow so json_to_cbor can use buf
+                    {
+                        let mut enc = make_encoder(&mut buf);
+                        enc.map(1).ok();   // outer map: 1 entry
+                        enc.str("Mergeable").ok();
+                        enc.map(1).ok();   // inner map: 1 entry
+                        enc.str("ActorInfo").ok();
+                        enc.map(actor_map.len() as u64).ok();
+                    } // enc dropped, releasing borrow on buf
 
                     for (hash_str, value) in &actor_map {
                         let hash: u64 = hash_str
@@ -2657,11 +2615,12 @@ fn parse_mergeable_cbor(data: &[u8], _path: &str) -> Result<Output> {
     // "U32"). If not, fall back to YAML output (the payload isn't representable
     // as native BYML).
     let is_roead_format = matches!(&raw_payload,
-        serde_json::Value::Object(m) if m.len() == 1 &&
+        serde_json::Value::Object(m) if m.len() == 1 && (
             m.contains_key("Map") || m.contains_key("Array") ||
             m.contains_key("String") || m.contains_key("Bool") ||
             m.contains_key("F32") || m.contains_key("F64") ||
             m.contains_key("I32") || m.contains_key("U32")
+        )
     );
 
     if !is_roead_format {
@@ -2809,7 +2768,6 @@ fn convert_file(path: &str) -> Result<Output> {
 
     // ── AAMP detection (bshop / aamp) ────────────────────────────────────
     if looks_like_aamp(&data) {
-        eprintln!("aamp...");
         return parse_aamp_file_output(&data, path);
     }
 
@@ -2818,7 +2776,6 @@ fn convert_file(path: &str) -> Result<Output> {
         // Check if this is ActorInfo BYML (has "Actors" and "Hashes" arrays)
         let stem = filename_stem(Path::new(path));
         if stem == "ActorInfo.product" && looks_like_actorinfo_byml(&data) {
-            eprintln!("actorinfo (byml)...");
             return parse_byml_actorinfo(&data, path);
         }
         return parse_byml_file_output(&data, path);
@@ -2826,28 +2783,23 @@ fn convert_file(path: &str) -> Result<Output> {
 
     // ── UKMM Mergeable CBOR detection ────────────────────────────────────
     if looks_like_actorinfo_cbor(&data) {
-        eprintln!("actorinfo...");
         return parse_actorinfo_cbor(&data, path);
     }
     // MessagePack must be checked BEFORE generic mergeable — it needs the
     // old Msyt-deserializing path (parse_cbor) that extracts proper Entry
     // structures from the JSON strings inside the CBOR, not raw JSON dumps.
     if looks_like_messagepack_cbor(&data) {
-        eprintln!("messagepack...");
         return parse_cbor(&data);
     }
     if looks_like_mergeable_cbor(&data) {
-        eprintln!("mergeable...");
         return parse_mergeable_cbor(&data, path);
     }
 
     // ── UKMM ResourceData::Sarc / Binary CBOR detection ─────────────────
     if looks_like_sarcmap_cbor(&data) {
-        eprintln!("sarcmap...");
         return parse_sarcmap_cbor(&data, path);
     }
     if looks_like_binary_cbor(&data) {
-        eprintln!("binary...");
         return parse_binary_cbor(&data, path);
     }
 
@@ -2906,6 +2858,19 @@ fn open_explorer(path: &Path) {
     let _ = std::process::Command::new("explorer").arg(abs.as_os_str()).spawn();
 }
 
+// Remove all files and subdirectories from a directory (but not the directory itself).
+fn clear_dir_contents(path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// Recursively copy a directory tree.
 ///
 /// Creates the destination directory, then recursively copies all files
@@ -2945,7 +2910,9 @@ fn add_dir_to_zip(base: &Path, dir: &Path, mut zip: &mut zip::ZipWriter<fs::File
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let name = path.strip_prefix(base).unwrap();
+        let name = path
+            .strip_prefix(base)
+            .with_context(|| format!("Path {} is not inside base directory {}", path.display(), base.display()))?;
         if entry.file_type()?.is_dir() {
             zip.add_directory::<&str, ()>(&name.to_string_lossy(), Default::default())?;
             add_dir_to_zip(base, &path, zip)?;
