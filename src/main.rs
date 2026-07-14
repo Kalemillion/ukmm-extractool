@@ -798,12 +798,39 @@ fn parse_cbor(data: &[u8]) -> Result<Output> {
         entries.insert("section_0".to_string(), serde_json::to_value(bt)?);
     }
 
-    Ok(Output {
+    let mut out = Output {
         language: None,
         entry_count: None,
         entries,
         format: None,
-    })
+    };
+    strip_contaminated(&mut out);
+    Ok(out)
+}
+
+/// Remove contaminated sections from an Output's entries, both at top level
+/// and nested inside message section values.
+///
+/// Contaminated sections are defined in [`FILTER_SECTIONS`] — they contain data
+/// from other games or test content that shouldn't be included in rebuilt UKMM
+/// archives.
+fn strip_contaminated(out: &mut Output) {
+    for section in FILTER_SECTIONS {
+        if out.entries.remove(*section).is_some() {
+            eprintln!("  ✓ Removed contaminated section '{section}'");
+        }
+    }
+    // Also filter nested keys inside section values (e.g. EventFlowMsg/...
+    // inside a Msg_EUfr section).
+    for entries_val in out.entries.values_mut() {
+        if let Some(section) = entries_val.as_object_mut() {
+            for filter_key in FILTER_SECTIONS {
+                if section.remove(*filter_key).is_some() {
+                    eprintln!("  ✓ Removed contaminated entry '{filter_key}'");
+                }
+            }
+        }
+    }
 }
 
 /// Serialize an `Output` struct to YAML and write to a file.
@@ -3133,11 +3160,7 @@ fn convert_file(path: &str) -> Result<Output> {
     let mut out = out_result?;
 
     // ── Strip contaminated sections ────────────────────────────────────────
-    for section in FILTER_SECTIONS {
-        if out.entries.remove(*section).is_some() {
-            eprintln!("  ✓ Removed contaminated section '{section}'");
-        }
-    }
+    strip_contaminated(&mut out);
 
     Ok(out)
 }
