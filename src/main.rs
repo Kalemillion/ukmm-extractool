@@ -1,17 +1,28 @@
 //! # ukmm-extractool
 //!
-//! Extracts and rebuilds UKMM mod files (`.byml`/`.sarc`) to/from
-//! editable YAML and native BYML — messages, actor info, generic mergeables.
-//!
-//! The only entry point is **interactive mode** (`-i`), which scans installed UKMM mods,
-//! lets the user pick one, extracts the single `Msg_*.product.sarc` inside the ZIP,
-//! converts it to JSON, and can later rebuild the ZIP from edited JSON.
+//! CLI tool to extract and rebuild UKMM mod files (`.byml`/`.sarc`) to/from
+//! editable YAML and native BYML — messages, actor info, AAMP/bshop, and
+//! generic mergeables.
 //!
 //! ## Pipeline
 //!
-//! **Extract**:  ZIP → extract → decompress (zstd/yaz0) → detect format → parse → serialize JSON
-//! **Rebuild**:  JSON → build CBOR wire format → zstd compress → inject into new ZIP
+//! **Extract**:  file → decompress (zstd/yaz0) → detect format → parse → serialize
+//! **Rebuild**:  YAML/.sbyml → CBOR wire format → zstd compress → inject into ZIP
+//!
+//! ## CLI
+//!
+//! ```text
+//! ukmm-extractool <COMMAND> [OPTIONS]
+//!
+//! Commands: extract, rebuild, restore, inspect, list
+//! ```
+//!
+//! With no arguments, launches the interactive TUI.
 
+mod cli;
+mod i18n;
+
+use crate::i18n::Lang;
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use indexmap::IndexMap;
@@ -214,11 +225,19 @@ fn dispatch_rebuild(out: &Output, stem: &str) -> Result<Vec<u8>> {
     match out.format.as_deref() {
         Some("BYML") => rebuild_byml_from_output(out),
         Some("Mergeable") => {
-            if let Some(b64) = out.entries.values().find_map(|v| {
+            // Try to find _sbyml_bytes — either as a nested key inside an
+            // entry value (format: { entryKey: { _sbyml_bytes: "..." } })
+            // or as a top-level entry key (format: { _sbyml_bytes: "..." }).
+            let b64 = out.entries.values().find_map(|v| {
                 v.as_object()
                     .and_then(|m| m.get("_sbyml_bytes"))
                     .and_then(|s| s.as_str())
-            }) {
+            })
+            .or_else(|| {
+                out.entries.get("_sbyml_bytes").and_then(|v| v.as_str())
+            });
+
+            if let Some(b64) = b64 {
                 let sbyml_bytes = base64_decode(b64)?;
                 let byml_data = decompress(&sbyml_bytes)
                     .context("Failed to decompress mergeable BYML")?;
@@ -927,11 +946,8 @@ fn detect_format(entries: &BTreeMap<String, serde_json::Value>) -> Option<&'stat
 
 /// Process a single file passed via CLI or drag-drop.
 ///
-/// Routes to the correct conversion based on extension and content:
-/// - `.byml`/`.sbyml` → forward conversion (BYML/ActorInfo → YAML/.sbyml)
-/// - `.bshop`/`.aamp`/`.sbshop` → forward conversion (AAMP → YAML)
-/// - `.yaml`/`.yml` → reverse conversion (AAMP YAML → binary) if it's AAMP
-fn process_single_file(path: &str) -> Result<()> {
+/// Routes to the correct conversion based on extension and content.
+fn process_single_file(path: &str, _lang: &Lang) -> Result<()> {
     let p = Path::new(path);
     if !p.exists() {
         anyhow::bail!("File not found: {}", path);
@@ -968,18 +984,13 @@ fn process_single_file(path: &str) -> Result<()> {
             println!("\nDone!\n");
             Ok(())
         }
-        "yaml" | "yml" => {
-            try_rebuild_aamp(path)
-        }
-        _ => {
-            anyhow::bail!("Unsupported file extension: .{ext}");
-        }
+        "yaml" | "yml" => try_rebuild_aamp(path, _lang),
+        _ => anyhow::bail!("Unsupported file extension: .{ext}"),
     }
 }
 
 /// Try to rebuild an AAMP binary from a YAML file containing `!io` text.
-/// Returns Ok(()) on success, or a descriptive error if not AAMP.
-fn try_rebuild_aamp(path: &str) -> Result<()> {
+fn try_rebuild_aamp(path: &str, _lang: &Lang) -> Result<()> {
     let p = Path::new(path);
     let yaml_text = fs::read_to_string(path)?;
     let val: serde_json::Value = serde_yaml::from_str(&yaml_text)?;
@@ -1005,20 +1016,47 @@ fn try_rebuild_aamp(path: &str) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    // If a file was passed as CLI argument or drag-dropped onto the exe,
-    // bypass the menu and process it directly.
-    if let Some(arg) = args.first() {
+    // ── Legacy mode: bare file path → auto-detect (backward compat) ─────
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(arg) = raw_args.first() {
         let path = arg.trim_matches('"');
-        if !Path::new(path).exists() {
-            anyhow::bail!("File not found: {}", path);
+        if !path.starts_with('-') && Path::new(path).extension().is_some() {
+            // No subcommand, looks like a file → legacy auto-detect.
+            let lang = parse_lang_from_env();
+            return process_single_file(path, &lang);
         }
-        return process_single_file(path);
     }
 
-    // On Linux, when launched by double-click, there's no terminal attached.
-    // Re-launch inside a terminal so the user can interact with the program.
+    // ── Clap parsing ────────────────────────────────────────────────────
+    let cli = cli::Cli::parse_or_exit();
+    let lang = match &cli.lang {
+        Some(code) => Lang::force(code),
+        None => Lang::detect(),
+    };
+
+    match &cli.command {
+        Some(cli::Commands::Extract { path }) => cmd_extract(&lang, path),
+        Some(cli::Commands::Rebuild { path }) => cmd_rebuild(&lang, path.as_deref()),
+        Some(cli::Commands::Restore { path }) => cmd_restore(&lang, path.as_deref()),
+        Some(cli::Commands::List) => cmd_list(&lang),
+        None => {
+            // No subcommand, no file path → interactive TUI.
+            linux_relaunch_if_no_tty()?;
+            run_interactive(&lang)
+        }
+    }
+}
+
+/// Simple env-var–only language detection (used in legacy path mode before clap).
+fn parse_lang_from_env() -> Lang {
+    match std::env::var("UKMM_LANG").ok().as_deref() {
+        Some("fr") => Lang::force("fr"),
+        _ => Lang::detect(),
+    }
+}
+
+/// On Linux, re-launch inside a terminal if no TTY is attached.
+fn linux_relaunch_if_no_tty() -> Result<()> {
     if cfg!(target_os = "linux") && !atty::is(atty::Stream::Stdin) {
         for term in [
             "xterm -e",
@@ -1033,76 +1071,30 @@ fn main() -> Result<()> {
             child.args(args);
             child.arg(&exe);
             if child.spawn().is_ok() {
-                // The new terminal window owns the interaction; this process exits.
                 return Ok(());
             }
         }
-        // No terminal found — fall through to interactive mode (will print nothing).
     }
-
-    // ── Main menu loop ───────────────────────────────────────────────────
-    loop {
-        let result = run_interactive();
-        match &result {
-            Ok(()) => {
-                prompt("\nPress Enter to return to menu... ");
-            }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                if msg.contains("Return to menu.") {
-                    // Cancel or no mods found — go back to menu.
-                    continue;
-                }
-                eprintln!("Error: {e:#}");
-                prompt("\nPress Enter to retry... ");
-            }
-        }
-    }
+    Ok(())
 }
 
-/// Print a prompt to stdout, flush, and read a single line from stdin.
-///
-/// Returns the trimmed line (without trailing newline). Returns empty string
-/// on any I/O error (e.g. EOF).
+/// Print a prompt to stdout, flush, and read a single line.
 fn prompt(message: &str) -> String {
     print!("{message}");
     io::stdout().flush().ok();
     let mut line = String::new();
     io::stdin().lock().read_line(&mut line).ok();
-    let line = line.trim().to_string();
-
-    // Detect a file dropped at any prompt and process it directly.
-    let path = line.trim_matches('"');
-    if Path::new(path).exists() {
-        let ext = Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        if matches!(ext, "byml" | "sbyml" | "bshop" | "aamp" | "sbshop" | "yaml" | "yml") {
-            eprintln!();
-            if let Err(e) = process_single_file(path) {
-                eprintln!("Error: {e:#}");
-            }
-            prompt("\nPress Enter to exit... ");
-            std::process::exit(0);
-        }
-    }
-
-    line
+    line.trim().to_string()
 }
 
-/// Interactive checkbox-style multi-select prompt.
+/// Resolve the UKMM data directory.
 ///
-/// Shows `items` with `[ ]` / `[x]` markers. The user enters a number to
-/// toggle an item and presses Enter (empty input) to confirm.
-/// Returns the list of selected items.
-/// Resolve the UKMM data directory based on platform conventions.
-///
-/// Resolution order:
+/// Order:
 /// 1. `%LOCALAPPDATA%/ukmm` (Windows)
-/// 2. `$XDG_DATA_HOME/ukmm` (Linux)
-/// 3. `~/.local/share/ukmm` (Linux/macOS fallback)
-/// 4. `./ukmm` (last resort)
+/// 2. `~/Library/Application Support/ukmm` (macOS)
+/// 3. `$XDG_DATA_HOME/ukmm` (Linux)
+/// 4. `~/.local/share/ukmm` (Linux/macOS fallback)
+/// 5. `./ukmm` (last resort)
 fn ukmm_data_dir() -> PathBuf {
     // Windows: %LOCALAPPDATA% is the standard per-user app data directory.
     if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
@@ -1123,15 +1115,6 @@ fn ukmm_data_dir() -> PathBuf {
 }
 
 /// A discovered UKMM mod in the interactive mod picker.
-struct ModEntry {
-    /// Human-readable display name (from `meta.yml` or filename stem).
-    display_name: String,
-    /// Path to the mod's ZIP file or directory.
-    path: PathBuf,
-    /// `true` if this is a loose directory (not a ZIP).
-    is_dir: bool,
-}
-
 /// Extract the `name:` field from a UKMM `meta.yml` file.
 ///
 /// Returns `None` if the file can't be read or the `name:` field is missing/empty.
@@ -1185,311 +1168,610 @@ fn collect_edited_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-/// Interactive mode: scan UKMM mods, pick one, convert all resource files.
+/// Interactive main menu loop.
 ///
-/// # Flow
-///
-/// 1. Ask user to select platform (Wii U / Switch)
-/// 2. Scan the corresponding UKMM mods directory for ZIPs (with UKMM resource files)
-///    and loose folders (with `meta.yml`)
-/// 3. Present a numbered list, let the user choose
-/// 4. Extract/copy the mod to a temp directory
-/// 5. Convert each resource file to YAML or BYML under `mods/<platform>/<mod_name>/`
-/// 6. Save the original mod as `<mod_name>_backup.zip`
-/// 7. If output already exists, offer to rebuild instead
-fn run_interactive() -> Result<()> {
-    println!();
-    println!("╔═════════════════════════╗");
-    println!("║     ukmm-extractool     ║");
-    println!("╚═════════════════════════╝");
-    println!();
-
-    let ukmm_root = ukmm_data_dir();
-    let wiiu_path = ukmm_root.join("wiiu").join("mods");
-    let nx_path = ukmm_root.join("nx").join("mods");
-
-    // ── Platform / Source selection ───────────────────────────────────────
-    let plat_choice = loop {
-        println!("Choose your platform:");
-        println!("  [1] Wii U");
-        println!("  [2] Switch");
-        println!("  [3] Info");
-        let c = prompt("\nSelect 1, 2 or 3: ");
-        match c.as_str() {
-            "1" | "2" | "3" => break c,
-            _ => eprintln!("Invalid choice — enter 1, 2, or 3.\n"),
-        }
-    };
-
-    // Option 3: show info.
-    if plat_choice == "3" {
+/// Presents a dialoguer-powered menu. Each option dispatches to a `cmd_*_interactive` function.
+fn run_interactive(lang: &Lang) -> Result<()> {
+    let mut err_count = 0u32;
+    loop {
         println!();
-        println!("╔════════════════════════════════════════════════╗");
-        println!("║               ukmm-extractool                  ║");
-        println!("╠════════════════════════════════════════════════╣");
-        println!("║  Extract and rebuild UKMM mod files:           ║");
-        println!("║                                                ║");
-        println!("║  • Message/*.product.sarc → structured .yaml   ║");
-        println!("║    (Msyt entries, editable, round-trip)        ║");
-        println!("║                                                ║");
-        println!("║  • Actor/*.byml (mergeable CBOR) → .sbyml      ║");
-        println!("║    (native BYML, edit with TotkBits)           ║");
-        println!("║                                                ║");
-        println!("║  • Actor/ActorInfo.product.byml → .sbyml       ║");
-        println!("║    (CBOR ActorInfo ↔ Actors/Hashes BYML)       ║");
-        println!("║                                                ║");
-        println!("║  • Other .byml files handled as GenericByml    ║");
-        println!("║    or fallback YAML for non-roead formats.     ║");
-        println!("║                                                ║");
-        println!("║  Supported formats:                            ║");
-        println!("║    - .byml / .sbyml (native Nintendo BYML)     ║");
-        println!("║    - UKMM .sarc / CBOR mergeable archives      ║");
-        println!("║    - .yaml / .yml (editable workspace)         ║");
-        println!("╚════════════════════════════════════════════════╝");
-        println!();
-        prompt("Press Enter to continue... ");
-        return run_interactive();
-    }
+        print_banner(lang);
 
-    let is_switch = plat_choice == "2";
-    let (platform, mods_dir) = if is_switch {
-        ("nx", nx_path)
-    } else {
-        ("wiiu", wiiu_path)
-    };
+        let choices = &[
+            lang.t("menu.extract"),
+            lang.t("menu.rebuild"),
+            lang.t("menu.restore"),
+            lang.t("menu.list"),
+            lang.t("menu.info"),
+            lang.t("menu.quit"),
+        ];
 
-    if !mods_dir.is_dir() {
-        anyhow::bail!(
-            "Directory not found: {}\nMake sure UKMM is installed.",
-            mods_dir.display()
-        );
-    }
+        let selection = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt(lang.t("menu.prompt"))
+            .items(choices)
+            .default(0)
+            .interact_opt()
+            .context("Failed to read selection")?;
 
-    // ── Scan for mods ─────────────────────────────────────────────────────
-    println!("\nScanning {}\n", mods_dir.display());
+        let result = match selection {
+            Some(0) => cmd_extract_interactive(lang),
+            Some(1) => cmd_rebuild_interactive(lang),
+            Some(2) => cmd_restore_interactive(lang),
+            Some(3) => cmd_list_interactive(lang),
+            Some(4) => {
+                show_info(lang)?;
+                continue;
+            }
+            _ => break, // Quit
+        };
 
-    let mut mods: Vec<ModEntry> = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(&mods_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let meta_path = path.join("meta.yml");
-                if meta_path.is_file() {
-                    // Accept any directory with meta.yml (all UKMM mods have it).
-                    let display =
-                        read_meta_name(&meta_path).unwrap_or_else(|| filename_stem(&path));
-                    mods.push(ModEntry {
-                        display_name: display,
-                        path,
-                        is_dir: true,
-                    });
+        match &result {
+            Ok(()) => {
+                err_count = 0;
+                prompt(&format!("\n{}", lang.t("common.back_to_menu")));
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains("Return to menu.") {
+                    err_count = 0;
+                    continue;
                 }
-            } else if path.extension().is_some_and(|e| e == "zip") {
-                let display =
-                    read_zip_meta_name(&path).unwrap_or_else(|| filename_stem(&path));
-                // Only show mods with meta.yml and valid names
-                if !display.is_empty() && display != filename_stem(&path) {
-                    mods.push(ModEntry {
-                        display_name: display,
-                        path,
-                        is_dir: false,
-                    });
+                eprintln!("{}: {e:#}", lang.t("common.error"));
+                err_count += 1;
+                if err_count >= 3 {
+                    eprintln!("\nToo many errors. Exiting.");
+                    break;
                 }
+                prompt(&format!("\n{}", lang.t("common.press_enter")));
             }
         }
     }
+    Ok(())
+}
 
-    mods.sort_by_key(|a| a.display_name.to_lowercase());
+/// Print the app banner.
+fn print_banner(lang: &Lang) {
+    let ver = lang.t("app.version");
+    println!("╔═════════════════════════════════════════╗");
+    println!("║             {}             ║", lang.t("app.title"));
+    println!("║  {}  ║", lang.t("app.subtitle"));
+    println!("║                 v{}                  ║", ver);
+    println!("╚═════════════════════════════════════════╝");
+}
 
+// ── Info screen ─────────────────────────────────────────────────────────────
+
+fn show_info(lang: &Lang) -> Result<()> {
+    println!();
+    println!("╔════════════════════════════════════════════════╗");
+    println!("║  {}  ║", lang.t("info.title"));
+    println!("╠════════════════════════════════════════════════╣");
+    println!("║                                                ║");
+    println!("║  {}  ║", lang.t("info.desc"));
+    println!("║                                                ║");
+    println!("║  {}  ║", lang.t("info.formats"));
+    println!("║                                                ║");
+    println!("║  {}  ║", lang.t("info.pipeline"));
+    println!("║                                                ║");
+    println!("║  {}  ║", lang.t("info.rebuild"));
+    println!("║                                                ║");
+    println!("║  {}  ║", lang.t("info.more"));
+    println!("╚════════════════════════════════════════════════╝");
+    println!();
+    prompt(lang.t("common.press_enter"));
+    Ok(())
+}
+
+// ── Command dispatchers (CLI) ───────────────────────────────────────────────
+
+fn cmd_extract(lang: &Lang, path: &str) -> Result<()> {
+    let p = Path::new(path);
+    if p.is_dir() || path.ends_with(".zip") {
+        // Mod-level extraction (ZIP or loose dir).
+        run_extract_mod(lang, path)
+    } else {
+        // Single file.
+        process_single_file(path, lang)
+    }
+}
+
+fn cmd_rebuild(lang: &Lang, path: Option<&str>) -> Result<()> {
+    let workspace = path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    if !workspace.is_dir() {
+        anyhow::bail!("{}", lang.t("common.file_not_found").replace("{path}", &workspace.display().to_string()));
+    }
+
+    // Find mod_name from workspace directory name.
+    let mod_name = filename_stem(&workspace);
+    let backup_path = workspace.join(format!("{mod_name}_backup.zip"));
+
+    if !backup_path.is_file() {
+        anyhow::bail!("{}", lang.t("restore.no_backup"));
+    }
+
+    // Detect original mod path.
+    let ukmm_root = ukmm_data_dir();
+    let (mod_path, is_dir) = find_mod_in_ukmm(&workspace, &mod_name, &ukmm_root);
+
+    run_rebuild(lang, &mod_name, &workspace, &mod_path, is_dir)
+}
+
+fn cmd_restore(lang: &Lang, path: Option<&str>) -> Result<()> {
+    let workspace = path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    if !workspace.is_dir() {
+        anyhow::bail!("{}", lang.t("common.file_not_found").replace("{path}", &workspace.display().to_string()));
+    }
+
+    let mod_name = filename_stem(&workspace);
+    let ukmm_root = ukmm_data_dir();
+    let (mod_path, is_dir) = find_mod_in_ukmm(&workspace, &mod_name, &ukmm_root);
+
+    run_restore(lang, &mod_name, &workspace, &mod_path, is_dir)
+}
+
+fn cmd_list(lang: &Lang) -> Result<()> {
+    let mods = scan_all_mods();
     if mods.is_empty() {
-        eprintln!("No mods found in {}.", mods_dir.display());
-        anyhow::bail!("Return to menu.");
+        println!("\n{}", lang.t("list.none"));
+        println!("  scan path: {}", ukmm_data_dir().join("{wiiu,nx}").display());
+        return Ok(());
+    }
+    println!("\n── {} ──", lang.t("list.title"));
+    println!(
+        "{}",
+        lang.t("list.header").replace("{n}", &mods.len().to_string())
+    );
+    for m in &mods {
+        let icon = if m.is_wiiu { "🩵" } else { "🔴" };
+        println!("  {} {}", icon, m.display_name);
+    }
+    println!();
+    Ok(())
+}
+
+// ── Interactive command helpers ─────────────────────────────────────────────
+
+fn cmd_extract_interactive(lang: &Lang) -> Result<()> {
+    let mods = scan_all_mods();
+    if mods.is_empty() {
+        eprintln!("{}", lang.t("extract.no_mods"));
+        let hint = lang.t("extract.no_mods_hint");
+        eprintln!("  {}", hint.replace("{path}", &ukmm_data_dir().display().to_string()));
+        anyhow::bail!("{}", lang.t("common.return_to_menu"));
     }
 
-    // ── Mod selection ─────────────────────────────────────────────────────
-    let mod_label = if mods.len() == 1 { "mod" } else { "mods" };
-    println!("Found {} {}:\n", mods.len(), mod_label);
-    for (i, m) in mods.iter().enumerate() {
-        println!("  [{:2}] {}", i + 1, m.display_name);
-    }
+    println!("\n── {} ──", lang.t("extract.title"));
+    println!("{}", lang.t("extract.scanning"));
 
-    let selection = prompt(&format!(
-        "\nSelect a mod to process (1-{}), or press Enter to cancel: ",
-        mods.len()
-    ));
-    if selection.is_empty() {
-        println!("Cancelled.\n");
-        anyhow::bail!("Return to menu.");
-    }
-    let index: usize = match selection.parse::<usize>() {
-        Ok(n) if n >= 1 && n <= mods.len() => n - 1,
-        _ => {
-            anyhow::bail!("Invalid selection.");
-        }
-    };
-    let chosen = &mods[index];
+    let choices: Vec<String> = mods
+        .iter()
+        .map(|m| {
+            let icon = if m.is_wiiu { "🩵  " } else { "🔴 " };
+            format!("{icon} {}", m.display_name)
+        })
+        .collect();
+    let choice_refs: Vec<&str> = choices.iter().map(|s| s.as_str()).collect();
+
+    let sel = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(lang.t("extract.select_prompt"))
+        .items(&choice_refs)
+        .default(0)
+        .interact_opt()
+        .context("Failed to read selection")?
+        .ok_or_else(|| anyhow::anyhow!("{}", lang.t("common.cancelled")))?;
+
+    let chosen = &mods[sel];
     let mod_name = filename_stem(&chosen.path);
-
-    println!("\n  Selected: {}", chosen.display_name);
-
-    let mod_dir_arg = format!("{}/{}", platform, mod_name);
+    let plat_label = if chosen.is_wiiu { "wiiu" } else { "nx" };
+    let mod_dir_arg = format!("{plat_label}/{mod_name}");
     let mods_out_dir = PathBuf::from("mods").join(&mod_dir_arg);
+    let mod_path = &chosen.path;
 
-    // Check for existing workspace (backup ZIP + any .json or .sbyml files recursively).
+    // Check for existing workspace.
     let has_existing = mods_out_dir
         .join(format!("{mod_name}_backup.zip"))
         .is_file()
         && has_json_or_sbyml_recursive(&mods_out_dir);
-    let action = if has_existing {
-        let a = loop {
-            let c = prompt("\nA workspace has been found. What to do with it?\n[1] Rebuild (send edited files to UKMM)\n[2] Extract again (UKMM > mod files)\n[3] Restore original (from backup)\n\nSelect 1, 2, or 3: ");
-            match c.trim() {
-                "1" => break "rebuild",
-                "2" => break "extract",
-                "3" => break "restore",
-                _ => eprintln!("Invalid choice — enter 1, 2, or 3.\n"),
-            }
-        };
-        a
-    } else {
-        "extract"
-    };
 
-    if action == "rebuild" {
-        return run_rebuild(
-            &mod_name,
-            &mods_out_dir,
-            &mod_dir_arg,
-            &chosen.path,
-            chosen.is_dir,
+    if has_existing {
+        let choices = &[
+            lang.t("menu.extract"),
+            lang.t("menu.rebuild"),
+            lang.t("menu.restore"),
+        ];
+        let sel = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt("A workspace exists. What to do?")
+            .items(choices)
+            .default(0)
+            .interact_opt()?
+            .ok_or_else(|| anyhow::anyhow!("{}", lang.t("common.cancelled")))?;
+
+        match sel {
+            1 => return run_rebuild(lang, &mod_name, &mods_out_dir, mod_path, chosen.is_dir),
+            2 => return run_restore(lang, &mod_name, &mods_out_dir, mod_path, chosen.is_dir),
+            _ => {} // 0 = extract again
+        }
+    }
+
+    run_extract_mod(lang, &mod_path.to_string_lossy())
+}
+
+fn cmd_rebuild_interactive(lang: &Lang) -> Result<()> {
+    let workspaces = scan_workspaces();
+    if workspaces.is_empty() {
+        eprintln!(
+            "{}",
+            lang.t("rebuild.no_workspaces")
+                .replace("{path}", "mods/")
         );
+        anyhow::bail!("{}", lang.t("common.return_to_menu"));
     }
 
-    if action == "restore" {
-        return run_restore(&mod_name, &mods_out_dir, &chosen.path, chosen.is_dir);
+    println!("\n── {} ──", lang.t("rebuild.title"));
+
+    let choices: Vec<&str> = workspaces
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    let sel = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(lang.t("rebuild.select_prompt"))
+        .items(&choices)
+        .default(0)
+        .interact_opt()?
+        .ok_or_else(|| anyhow::anyhow!("{}", lang.t("common.cancelled")))?;
+
+    let (mod_name, ws_dir) = &workspaces[sel];
+    let backup_path = ws_dir.join(format!("{mod_name}_backup.zip"));
+
+    if !backup_path.is_file() {
+        anyhow::bail!("{}", lang.t("restore.no_backup"));
     }
 
-    // ── Extract/copy mod to temp directory ────────────────────────────────
+    let ukmm_root = ukmm_data_dir();
+    let (mod_path, is_dir) = find_mod_in_ukmm(ws_dir, mod_name, &ukmm_root);
+
+    // Confirm.
+    let confirm_msg = lang.t("rebuild.confirm").replace("{mod_name}", mod_name);
+    if !confirm_with_user(lang, &confirm_msg, lang.t("rebuild.confirm_details")) {
+        println!("{}", lang.t("common.cancelled"));
+        return Ok(());
+    }
+
+    run_rebuild(lang, mod_name, ws_dir, &mod_path, is_dir)
+}
+
+fn cmd_restore_interactive(lang: &Lang) -> Result<()> {
+    let workspaces = scan_workspaces();
+    if workspaces.is_empty() {
+        eprintln!(
+            "{}",
+            lang.t("rebuild.no_workspaces")
+                .replace("{path}", "mods/")
+        );
+        anyhow::bail!("{}", lang.t("common.return_to_menu"));
+    }
+
+    println!("\n── {} ──", lang.t("restore.title"));
+
+    let choices: Vec<&str> = workspaces
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    let sel = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(lang.t("restore.select_prompt"))
+        .items(&choices)
+        .default(0)
+        .interact_opt()?
+        .ok_or_else(|| anyhow::anyhow!("{}", lang.t("common.cancelled")))?;
+
+    let (mod_name, ws_dir) = &workspaces[sel];
+    let backup_path = ws_dir.join(format!("{mod_name}_backup.zip"));
+
+    if !backup_path.is_file() {
+        anyhow::bail!("{}", lang.t("restore.no_backup"));
+    }
+
+    let ukmm_root = ukmm_data_dir();
+    let (mod_path, is_dir) = find_mod_in_ukmm(ws_dir, mod_name, &ukmm_root);
+
+    // Confirm.
+    let confirm_msg = lang.t("restore.confirm").replace("{mod_name}", mod_name);
+    if !confirm_with_user(lang, &confirm_msg, lang.t("restore.confirm_details")) {
+        println!("{}", lang.t("common.cancelled"));
+        return Ok(());
+    }
+
+    run_restore(lang, mod_name, ws_dir, &mod_path, is_dir)
+}
+
+fn cmd_list_interactive(lang: &Lang) -> Result<()> {
+    cmd_list(lang)
+}
+
+// ── Confirmation helper ─────────────────────────────────────────────────────
+
+fn confirm_with_user(lang: &Lang, msg: &str, details: &str) -> bool {
+    println!("\n⚠  {msg}\n   {details}\n");
+    let choices = &[lang.t("common.yes"), lang.t("common.no")];
+    let sel = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(lang.t("common.confirm"))
+        .items(choices)
+        .default(1)
+        .interact_opt();
+    matches!(sel, Ok(Some(0)))
+}
+
+// ── Scanning helpers ────────────────────────────────────────────────────────
+
+/// Platform-tagged mod entry.
+struct ModEntry {
+    display_name: String,
+    path: PathBuf,
+    is_dir: bool,
+    is_wiiu: bool,
+}
+
+/// Scan both Wii U and Switch mod directories, return a unified list.
+fn scan_all_mods() -> Vec<ModEntry> {
+    let ukmm_root = ukmm_data_dir();
+    let mut mods = Vec::new();
+
+    for (plat_name, is_wiiu) in [("wiiu", true), ("nx", false)] {
+        let mods_dir = ukmm_root.join(plat_name).join("mods");
+        if !mods_dir.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&mods_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let meta_path = path.join("meta.yml");
+                    if meta_path.is_file() {
+                        let display =
+                            read_meta_name(&meta_path).unwrap_or_else(|| filename_stem(&path));
+                        mods.push(ModEntry {
+                            display_name: display,
+                            path,
+                            is_dir: true,
+                            is_wiiu,
+                        });
+                    }
+                } else if path.extension().is_some_and(|e| e == "zip") {
+                    let display =
+                        read_zip_meta_name(&path).unwrap_or_else(|| filename_stem(&path));
+                    if !display.is_empty() && display != filename_stem(&path) {
+                        mods.push(ModEntry {
+                            display_name: display,
+                            path,
+                            is_dir: false,
+                            is_wiiu,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    mods.sort_by(|a, b| {
+        // Plateforme d'abord (Wii U avant Switch)
+        a.is_wiiu
+            .cmp(&b.is_wiiu)
+            .reverse() // true (Wii U) > false (Switch), reverse pour Wii U first
+            .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()))
+    });
+    mods
+}
+
+/// Scan `mods/` directory for workspaces (subdirs with a backup ZIP).
+fn scan_workspaces() -> Vec<(String, PathBuf)> {
+    let mods_root = PathBuf::from("mods");
+    let mut ws = Vec::new();
+    let Ok(entries) = fs::read_dir(&mods_root) else {
+        return ws;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Check for backup ZIP inside.
+            for platform_entry in fs::read_dir(&path).into_iter().flatten() {
+                let Ok(platform_entry) = platform_entry else { continue };
+                let plat_path = platform_entry.path();
+                if !plat_path.is_dir() {
+                    continue;
+                }
+                let name = filename_stem(&plat_path);
+                let backup = plat_path.join(format!("{name}_backup.zip"));
+                if backup.is_file() {
+                    ws.push((name, plat_path));
+                }
+            }
+        }
+    }
+    ws.sort_by_key(|(name, _)| name.to_lowercase());
+    ws
+}
+
+/// Try to locate the original mod path in UKMM's installation directory.
+fn find_mod_in_ukmm(ws_dir: &Path, mod_name: &str, ukmm_root: &Path) -> (PathBuf, bool) {
+    for plat in &["wiiu", "nx"] {
+        let mods_dir = ukmm_root.join(plat).join("mods");
+        // Check directory mod
+        let dir_path = mods_dir.join(mod_name);
+        if dir_path.join("meta.yml").is_file() {
+            return (dir_path, true);
+        }
+        // Check ZIP mod
+        let zip_path = mods_dir.join(format!("{mod_name}.zip"));
+        if zip_path.is_file() {
+            return (zip_path, false);
+        }
+    }
+    // Fallback: workspace-relative path
+    (ws_dir.join(format!("{mod_name}.zip")), false)
+}
+
+/// Extract a mod (ZIP or directory) to the workspace and convert all files.
+fn run_extract_mod(lang: &Lang, mod_path: &str) -> Result<()> {
+    let p = Path::new(mod_path);
+    let mod_name = filename_stem(p);
     let temp_base = std::env::temp_dir().join("ukmm-extractool");
     let extract_dir = temp_base.join(&mod_name);
+
+    // ── Determine platform ────────────────────────────────────────────────
+    let is_wiiu = mod_path.contains("/wiiu/") || mod_path.contains("\\wiiu\\");
+    let platform = if is_wiiu { "wiiu" } else { "nx" };
+    let mod_dir_arg = format!("{platform}/{mod_name}");
+    let mods_out_dir = PathBuf::from("mods").join(&mod_dir_arg);
+
+    // ── Extract/copy to temp ──────────────────────────────────────────────
     if extract_dir.exists() {
         fs::remove_dir_all(&extract_dir)?;
     }
 
-    if chosen.is_dir {
-        println!("  Copying loose mod folder...");
-        copy_dir_all(&chosen.path, &extract_dir)?;
+    if p.is_dir() {
+        println!("  {}...", lang.t("extract.copying_dir"));
+        copy_dir_all(p, &extract_dir)?;
     } else {
-        println!("  Extracting ZIP...");
-        let zip_file = fs::File::open(&chosen.path)?;
+        println!("  {}...", lang.t("extract.extracting_zip"));
+        let zip_file = fs::File::open(p)?;
         let mut archive = zip::ZipArchive::new(zip_file)?;
         archive.extract(&extract_dir)?;
     }
 
-    // ── Convert all resource files ────────────────────────────────────────
-    println!("\n── Converting mod files ──\n");
-
+    // ── Find resource files ───────────────────────────────────────────────
     let resource_files = find_resource_files(&extract_dir);
-
     if resource_files.is_empty() {
-        anyhow::bail!("No UKMM resource files found in the mod.");
+        anyhow::bail!("{}", lang.t("extract.no_files"));
     }
 
-    // Process files in parallel. Each file maps to its own output; no shared state.
-    let results: Vec<Result<()>> = resource_files
+    println!("  {} {} {}", lang.t("common.files_count"), resource_files.len(), lang.t("extract.title").to_lowercase());
+
+    // Sort files for deterministic progress order.
+    let mut sorted_files: Vec<&PathBuf> = resource_files.iter().collect();
+    sorted_files.sort_by_key(|p| p.display().to_string());
+
+    // ── Convert in parallel with progress ─────────────────────────────────
+    let total = sorted_files.len();
+    let results: Vec<Result<(usize, ())>> = sorted_files
         .par_iter()
-        .map(|file| -> Result<()> {
+        .enumerate()
+        .map(|(i, file)| -> Result<(usize, ())> {
             let file_path = file.display().to_string();
             let relative = file.strip_prefix(&extract_dir).unwrap_or(file);
             let stem = filename_stem(file);
             let ext = file.extension().and_then(|x| x.to_str()).unwrap_or("");
 
-            // Message SARCs: process through convert_file with SARC → structured YAML
+            // Message SARCs
             if stem.starts_with("Msg_") && ext.ends_with("arc") {
                 let output_path = mods_out_dir.join(relative).with_extension("yaml");
                 if let Some(parent) = output_path.parent() {
-                    fs::create_dir_all(parent)?;
+                    let _ = fs::create_dir_all(parent);
                 }
+                let prog = lang.t("extract.progress")
+                    .replace("{current}", &(i + 1).to_string())
+                    .replace("{total}", &total.to_string())
+                    .replace("{file}", &file.display().to_string());
+                eprintln!("  {prog}");
                 write_output(&convert_file(&file_path)?, &output_path)?;
-                return Ok(());
+                return Ok((i, ()));
             }
 
-            // Use dispatch_extract for the standard format pipeline.
             let out = match convert_file(&file_path) {
                 Ok(o) => o,
                 Err(e) => {
-                    eprintln!("  ⚠ Skipping {}: {e}", file.display());
-                    return Ok(());
+                    eprintln!("  ⚠ {}: {} ({e})", lang.t("common.skipped"), file.display());
+                    return Ok((i, ()));
                 }
             };
+
             let parent_dir = mods_out_dir
                 .join(relative)
                 .parent()
                 .unwrap_or(&mods_out_dir)
                 .to_path_buf();
-            fs::create_dir_all(&parent_dir)?;
+            let _ = fs::create_dir_all(&parent_dir);
 
-            let output_path = mods_out_dir.join(relative).with_extension(extract_extension(&out));
-            match dispatch_extract(&out)? {
+            let prog = lang.t("extract.progress")
+                .replace("{current}", &(i + 1).to_string())
+                .replace("{total}", &total.to_string())
+                .replace("{file}", &file.display().to_string());
+            eprintln!("  {prog}");
+
+            // Try to produce binary output (BYML / compressed CBOR).
+            // If dispatch_extract returns None, fall back to YAML.
+            let extracted = dispatch_extract(&out)?;
+            let output_path = mods_out_dir.join(relative).with_extension(
+                if extracted.is_some() { extract_extension(&out) } else { "yaml" }
+            );
+            match extracted {
                 Some(bytes) => {
                     fs::write(&output_path, &bytes)?;
-                    eprintln!("  ✓ Converted to native BYML: {}", output_path.display());
+                    eprintln!("    {}", lang.t("extract.converted_byml").replace("{path}", &output_path.display().to_string()));
                 }
                 None => {
                     write_output(&out, &output_path)?;
                 }
             }
-            Ok(())
+            Ok((i, ()))
         })
         .collect();
 
-    // Propagate first error if any.
+    // Collect results for summary.
+    let mut converted = 0u32;
+    let mut skipped = 0u32;
     for r in &results {
-        if let Err(e) = r {
-            anyhow::bail!("{}", e);
+        match r {
+            Ok(_) => converted += 1,
+            Err(e) => {
+                eprintln!("  ⚠ {}", e);
+                skipped += 1;
+            }
         }
     }
 
-    // ── Save backup (only if it doesn't already exist) ────────────────────
+    // ── Save backup ───────────────────────────────────────────────────────
     let backup_name = format!("{mod_name}_backup.zip");
     let backup_path = mods_out_dir.join(&backup_name);
 
     if !backup_path.exists() {
         fs::create_dir_all(&mods_out_dir)?;
-        if !chosen.is_dir {
-            fs::copy(&chosen.path, &backup_path)?;
-            println!("  ✓ Backup saved: {}", backup_path.display());
-        } else {
+        if p.is_dir() {
             create_zip_from_dir(&extract_dir, &backup_path)?;
+        } else {
+            fs::copy(p, &backup_path)?;
         }
+        println!("\n  {}", lang.t("extract.backup_saved").replace("{path}", &backup_path.display().to_string()));
     }
 
-    fs::remove_dir_all(&extract_dir)?;
+    let _ = fs::remove_dir_all(&extract_dir);
 
-    // ── Summary ──────────────────────────────────────────────────────────
-    println!("\n── Summary ──");
-    println!("  Platform:     {platform}");
-    println!("  Mod:          {}", chosen.display_name);
-    println!("  Files:        {}", resource_files.len());
-    println!("  Output:       {}", mods_out_dir.display());
-    println!("\nDone!\n");
-    open_explorer(&mods_out_dir);
+    // ── Summary ───────────────────────────────────────────────────────────
+    println!("\n─── {} ───", lang.t("extract.summary_title"));
+    println!("  {}: {}", lang.t("extract.summary_mod"), mod_name);
+    println!("  {}: {platform}", lang.t("extract.summary_platform"));
+    println!("  {}: {converted}", lang.t("extract.summary_converted"));
+    if skipped > 0 {
+        println!("  {}: {skipped}", lang.t("extract.summary_skipped"));
+    }
+    println!("  {}: {}", lang.t("common.output_dir"), mods_out_dir.display());
+    println!("\n{}", lang.t("common.done"));
 
     Ok(())
 }
 
-/// Rebuild a UKMM mod ZIP from edited JSON files.
-///
-/// Reads all `.json` files from the output directory, converts each back to
-/// a CBOR SARC blob via `from_json_to_cbor()`, then injects them into a copy
-/// of the backup ZIP. Original `Message/<name>.sarc` entries are replaced;
-/// all other ZIP entries are copied as-is. Converted entries use
-/// `CompressionMethod::Stored` (no additional compression).
+/// Rebuild a UKMM mod ZIP from edited JSON/SBYML files.
 fn run_rebuild(
+    lang: &Lang,
     mod_name: &str,
     mods_out_dir: &Path,
-    _mod_dir_arg: &str,
     mod_path: &Path,
     is_dir: bool,
 ) -> Result<()> {
@@ -1498,85 +1780,116 @@ fn run_rebuild(
     let modified_name = format!("{mod_name}.zip");
     let modified_path = mods_out_dir.join(&modified_name);
 
-    println!("\n── Rebuilding modified ZIP from edited files ──\n");
+    println!("\n── {} ──\n", lang.t("rebuild.title"));
 
-    // ── Collect edited files recursively from the output directory ────────
+    // ── Collect edited files recursively ──────────────────────────────────
     let mut edited_files: Vec<PathBuf> = {
         let mut files = Vec::new();
         collect_edited_files(mods_out_dir, &mut files);
         files
     };
 
-    // Dedup: if both `.sbyml` and `.yaml` exist for the same stem,
-    // keep only the `.sbyml` (it's the canonical edited format).
-    edited_files.sort_by(|a, b| {
-        let a_stem = a.file_stem().and_then(OsStr::to_str).unwrap_or("");
-        let b_stem = b.file_stem().and_then(OsStr::to_str).unwrap_or("");
-        let a_is_sbyml = a.extension().is_some_and(|x| x == "sbyml");
-        let b_is_sbyml = b.extension().is_some_and(|x| x == "sbyml");
-        // Sort sbyml before yaml for the same stem, then by path.
-        a_stem.cmp(b_stem).then_with(|| b_is_sbyml.cmp(&a_is_sbyml))
-    });
-    edited_files.dedup_by(|a, b| a.file_stem() == b.file_stem());
+    // Handle dedup interactively if both .yaml and .sbyml exist for same stem.
+    let mut seen_stems: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deduped: Vec<PathBuf> = Vec::new();
+    for f in &edited_files {
+        let stem = f.file_stem().and_then(OsStr::to_str).unwrap_or("").to_string();
+        if seen_stems.contains(&stem) {
+            // Duplicate — ask user which to keep if not already decided.
+            let is_sbyml = f.extension().is_some_and(|x| x == "sbyml");
+            let dup_msg = lang.t("rebuild.dup_found").replace("{stem}", &stem);
+            let choices = &[
+                lang.t("rebuild.dup_sbyml"),
+                lang.t("rebuild.dup_yaml"),
+            ];
+            let sel = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                .with_prompt(&dup_msg)
+                .items(choices)
+                .default(if is_sbyml { 0 } else { 1 })
+                .interact_opt()?
+                .unwrap_or(if is_sbyml { 0 } else { 1 });
+            if sel == 0 && is_sbyml {
+                // Keep the sbyml (already in deduped), skip yaml
+                continue;
+            } else if sel == 1 && !is_sbyml {
+                // Keep the yaml — replace the sbyml entry
+                deduped.retain(|d| d.file_stem() != f.file_stem());
+                deduped.push(f.clone());
+                continue;
+            }
+            // else keep the new one
+        }
+        seen_stems.insert(stem);
+        deduped.push(f.clone());
+    }
+    edited_files = deduped;
 
     if edited_files.is_empty() {
-        anyhow::bail!("No edited files found in {}.", mods_out_dir.display());
+        anyhow::bail!("{}", lang.t("rebuild.no_files"));
     }
 
-    // ── Convert each edited file back to a CBOR SARC or BYML blob ────────
+    // ── Convert each edited file ──────────────────────────────────────────
+    let total = edited_files.len();
     let mut converted: Vec<(String, Vec<u8>)> = Vec::new();
-    for file_path in &edited_files {
-        // Preserve relative path from workspace for correct ZIP entry location.
+    for (i, file_path) in edited_files.iter().enumerate() {
         let relative = file_path.strip_prefix(mods_out_dir).unwrap_or(file_path);
         let stem = file_path
             .file_stem()
             .and_then(OsStr::to_str)
             .unwrap_or("unknown");
 
-        // ── .sbyml (native BYML) ────────────────────────────────────────
+        let prog = lang.t("rebuild.progress")
+            .replace("{current}", &(i + 1).to_string())
+            .replace("{total}", &total.to_string())
+            .replace("{file}", &file_path.display().to_string());
+        eprintln!("  {prog}");
+
+        // ── .sbyml (native BYML) ─────────────────────────────────────────
         if file_path.extension().is_some_and(|x| x == "sbyml") {
             let raw = fs::read(file_path)?;
             let data = decompress(&raw)?;
 
-            // Check if this is a mergeable .sbyml (not ActorInfo BYML).
-            // Mergeable BYML has a single Map key with serde-tagged values;
-            // ActorInfo BYML has "Actors" and "Hashes" arrays.
-            // Non-map BYML (scalar/array/string) is NOT mergeable.
-            let is_mergeable = match roead::byml::Byml::from_binary(&data) {
-                Ok(byml) => byml.as_map().is_ok_and(|map| {
-                    let has_actors = map.contains_key("Actors");
-                    let has_hashes = map.contains_key("Hashes");
-                    !has_actors && !has_hashes
-                }),
-                Err(_) => false,
+            // Classify: ActorInfo (Actors + Hashes arrays), Mergeable
+            // (single serde-tagged Map), or generic BYML.
+            let (is_actorinfo, is_mergeable) = match roead::byml::Byml::from_binary(&data) {
+                Ok(byml) => {
+                    let is_map = byml.as_map().is_ok();
+                    let has_actors = byml.as_map().is_ok_and(|m| m.contains_key("Actors"));
+                    let has_hashes = byml.as_map().is_ok_and(|m| m.contains_key("Hashes"));
+                    (is_map && has_actors && has_hashes, is_map && !has_actors && !has_hashes)
+                }
+                Err(_) => (false, false),
             };
 
             if is_mergeable {
                 let cbor_bytes = sbyml_to_mergeable_cbor(&data, stem)?;
                 let zip_entry = relative.with_extension("byml");
                 let zip_name = zip_entry.to_string_lossy().to_string();
-                println!(
-                    "  Converting (Mergeable): {} → {zip_name}",
-                    file_path.file_name().unwrap_or_default().to_string_lossy()
-                );
                 converted.push((zip_name, cbor_bytes));
-            } else {
-                // Native ActorInfo BYML (Actors/Hashes format).
+            } else if is_actorinfo {
                 let out = parse_byml_actorinfo(&data, &file_path.to_string_lossy())?;
                 let raw_cbor = rebuild_actorinfo_from_output(&out)?;
                 let compressed = zstd_compress(&raw_cbor)?;
                 let zip_entry = relative.with_extension("byml");
                 let zip_name = zip_entry.to_string_lossy().to_string();
-                println!(
-                    "  Converting (ActorInfo): {} → {zip_name}",
-                    file_path.file_name().unwrap_or_default().to_string_lossy()
-                );
                 converted.push((zip_name, compressed));
+            } else {
+                // Generic BYML: round-trip through Output → dispatch_rebuild.
+                let out = parse_byml_file_output(&data, &file_path.to_string_lossy())?;
+                let zip_entry = relative.with_extension("byml");
+                let zip_name = zip_entry.to_string_lossy().to_string();
+                let cbor_bytes = dispatch_rebuild(&out, stem)?;
+                let conv_msg = lang.t("rebuild.converting")
+                    .replace("{fmt}", "BYML")
+                    .replace("{src}", &file_path.file_name().unwrap_or_default().to_string_lossy())
+                    .replace("{dst}", &zip_name);
+                eprintln!("    {conv_msg}");
+                converted.push((zip_name, cbor_bytes));
             }
             continue;
         }
 
-        // ── .yaml ───────────────────────────────────────────────────────
+        // ── .yaml ─────────────────────────────────────────────────────────
         let yaml_text = fs::read_to_string(file_path)?;
         let val: serde_json::Value = serde_yaml::from_str(&yaml_text)
             .with_context(|| format!("Failed to parse {}.", file_path.display()))?;
@@ -1584,7 +1897,6 @@ fn run_rebuild(
             format!("Failed to convert YAML {} to Output.", file_path.display())
         })?;
 
-        // Auto-detect format from entries structure when stripped from YAML.
         if out.format.is_none() {
             out.format = detect_format(&out.entries).map(String::from);
         }
@@ -1593,37 +1905,28 @@ fn run_rebuild(
             .with_extension(rebuild_extension(&out))
             .to_string_lossy()
             .to_string();
-
-        let stem = file_path
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .unwrap_or("unknown");
-
-        let format_label = out.format.as_deref().unwrap_or("Message");
         let cbor_bytes = dispatch_rebuild(&out, stem)?;
-        println!(
-            "  Converting ({format_label}): {} → {zip_name}",
-            file_path.file_name().unwrap_or_default().to_string_lossy()
-        );
+
+        let fmt_label = out.format.as_deref().unwrap_or("Message");
+        let conv_msg = lang.t("rebuild.converting")
+            .replace("{fmt}", fmt_label)
+            .replace("{src}", &file_path.file_name().unwrap_or_default().to_string_lossy())
+            .replace("{dst}", &zip_name);
+        eprintln!("    {conv_msg}");
         converted.push((zip_name, cbor_bytes));
     }
 
     if converted.is_empty() {
-        anyhow::bail!("No JSON files could be converted.");
+        anyhow::bail!("{}", lang.t("err.no_valid_files"));
     }
 
     // ── Build modified ZIP ────────────────────────────────────────────────
-    // Strategy: scan the backup ZIP to find the correct entry path for each
-    // converted file (by matching on filename stem), then copy all non-replaced
-    // entries and append the new ones.
     let backup_file = fs::File::open(&backup_path)?;
     let mut backup_archive = zip::ZipArchive::new(backup_file)?;
     let modified_file = fs::File::create(&modified_path)?;
     let mut modified_zip = zip::ZipWriter::new(modified_file);
 
     // Build a map: filename stem → full entry path in the backup ZIP.
-    // E.g., "EventInfo.product" → "Event/EventInfo.product.byml"
-    // This lets us find the right entry regardless of subdirectory nesting.
     let mut backup_entry_map: BTreeMap<String, String> = BTreeMap::new();
     for i in 0..backup_archive.len() {
         if let Ok(entry) = backup_archive.by_index_raw(i) {
@@ -1635,38 +1938,27 @@ fn run_rebuild(
         }
     }
 
-    // Resolve the actual ZIP entry path for each converted file.
+    // Resolve ZIP entry paths.
     let resolved: Vec<(String, Vec<u8>)> = converted
         .into_iter()
         .map(|(workspace_path, data)| {
             let path = Path::new(&workspace_path);
-            let stem = path
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .unwrap_or("");
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            let target_name = format!("{stem}.{ext}");
-            // Look up the backup entry by stem; fall back to workspace path.
+            let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or("");
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let zip_name = backup_entry_map
                 .remove(stem)
-                .unwrap_or_else(|| {
-                    eprintln!("  Warning: no backup entry found for '{target_name}', using workspace path");
-                    workspace_path
-                });
+                .unwrap_or_else(|| format!("{stem}.{ext}"));
             (zip_name, data)
         })
         .collect();
 
-    // Copy all original entries, skipping the ones we're replacing.
+    // Copy all original entries, skipping replaced ones.
     let resolved_names: Vec<&str> = resolved.iter().map(|(n, _)| n.as_str()).collect();
     for i in 0..backup_archive.len() {
         let mut entry = backup_archive.by_index(i)?;
         let entry_name = entry.name().to_string();
         if resolved_names.contains(&entry_name.as_str()) {
-            continue; // Replaced below.
+            continue;
         }
         let options = if entry.is_dir() {
             modified_zip.add_directory::<&str, ()>(&entry_name, Default::default())?;
@@ -1680,7 +1972,7 @@ fn run_rebuild(
         io::copy(&mut entry, &mut modified_zip)?;
     }
 
-    // Append the new (or modified) entries using their resolved ZIP paths.
+    // Append new/modified entries.
     for (entry_name, entry_bytes) in &resolved {
         modified_zip.start_file::<&str, ()>(
             entry_name,
@@ -1688,21 +1980,17 @@ fn run_rebuild(
                 .compression_method(zip::CompressionMethod::Stored),
         )?;
         modified_zip.write_all(entry_bytes)?;
-        println!("  Added: {entry_name}");
+        let add_msg = lang.t("rebuild.adding_zip").replace("{name}", entry_name);
+        eprintln!("    {add_msg}");
     }
 
     modified_zip.finish()?;
 
-    println!("\n── Summary ──");
-    println!("  Modified ZIP: {}", modified_path.display());
-    println!("  Files converted: {}", resolved.len());
-
-    // ── Copy modified ZIP back to UKMM mods directory ────────────────────
+    // ── Copy back to UKMM ─────────────────────────────────────────────────
     if !is_dir {
         fs::copy(&modified_path, mod_path)?;
-        println!("  ✓ Copied to UKMM: {}", mod_path.display());
+        println!("\n  {}", lang.t("rebuild.copied_ukmm").replace("{path}", &mod_path.display().to_string()));
     } else {
-        // For loose directories, extract the rebuilt ZIP over the original.
         let temp_extract = mods_out_dir.join("_rebuild_extract");
         if temp_extract.exists() {
             fs::remove_dir_all(&temp_extract)?;
@@ -1711,38 +1999,42 @@ fn run_rebuild(
         let zip_file = fs::File::open(&modified_path)?;
         let mut archive = zip::ZipArchive::new(zip_file)?;
         archive.extract(&temp_extract)?;
-        // Remove old contents and copy new ones.
         clear_dir_contents(mod_path)?;
         copy_dir_all(&temp_extract, mod_path)?;
         fs::remove_dir_all(&temp_extract)?;
-        println!("  ✓ Extracted to UKMM directory: {}", mod_path.display());
+        println!("\n  {}", lang.t("rebuild.copied_ukmm").replace("{path}", &mod_path.display().to_string()));
     }
 
-    // ── Remove the intermediate modified .zip from the output directory ──
     let _ = fs::remove_file(&modified_path);
 
-    println!("\nDone!\n");
+    let done_msg = lang.t("rebuild.done")
+        .replace("{n}", &resolved.len().to_string())
+        .replace("{path}", &mods_out_dir.display().to_string());
+    println!("\n{done_msg}\n");
 
     Ok(())
 }
 
-/// Restore the original backup ZIP back to the UKMM mods directory.
-///
-/// Copies the `_backup.zip` from the workspace back to UKMM (for ZIP mods),
-/// or extracts it over the loose directory (for folder mods).
-fn run_restore(mod_name: &str, mods_out_dir: &Path, mod_path: &Path, is_dir: bool) -> Result<()> {
+/// Restore the original backup ZIP back to UKMM.
+fn run_restore(
+    lang: &Lang,
+    mod_name: &str,
+    mods_out_dir: &Path,
+    mod_path: &Path,
+    is_dir: bool,
+) -> Result<()> {
     let backup_name = format!("{mod_name}_backup.zip");
     let backup_path = mods_out_dir.join(&backup_name);
 
     if !backup_path.exists() {
-        anyhow::bail!("Backup not found: {}", backup_path.display());
+        anyhow::bail!("{}", lang.t("restore.no_backup"));
     }
 
-    println!("\n── Restoring original mod from backup ──\n");
+    println!("\n── {} ──\n", lang.t("restore.title"));
 
     if !is_dir {
         fs::copy(&backup_path, mod_path)?;
-        println!("  ✓ Restored: {}", mod_path.display());
+        println!("  {}", lang.t("restore.done").replace("{mod_name}", mod_name));
     } else {
         let temp_extract = mods_out_dir.join("_restore_extract");
         if temp_extract.exists() {
@@ -1755,10 +2047,10 @@ fn run_restore(mod_name: &str, mods_out_dir: &Path, mod_path: &Path, is_dir: boo
         clear_dir_contents(mod_path)?;
         copy_dir_all(&temp_extract, mod_path)?;
         fs::remove_dir_all(&temp_extract)?;
-        println!("  ✓ Restored to UKMM directory: {}", mod_path.display());
+        println!("  {}", lang.t("restore.done").replace("{mod_name}", mod_name));
     }
 
-    println!("\nDone!\n");
+    println!("\n{}", lang.t("common.done"));
     Ok(())
 }
 
@@ -2845,17 +3137,6 @@ fn convert_file(path: &str) -> Result<Output> {
     }
 
     Ok(out)
-}
-
-/// Open Windows Explorer at the given directory.
-fn open_explorer(path: &Path) {
-    let abs = match path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => path.parent()
-            .and_then(|p| p.canonicalize().ok())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join(path)),
-    };
-    let _ = std::process::Command::new("explorer").arg(abs.as_os_str()).spawn();
 }
 
 // Remove all files and subdirectories from a directory (but not the directory itself).
