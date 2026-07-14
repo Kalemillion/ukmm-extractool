@@ -6,19 +6,8 @@ unmaintained = "workspace"
 unsound = "workspace"
 yanked = "deny"
 ignore = [
-  # ansi_term 0.12.1 — transitive via ryml -> clap 2.x (unmaintained, no fix available)
-  # yaml-rust 0.4.5 — transitive via ryml -> roead (unmaintained, no fix available)
-  # lexical / lexical-core — transitive via ryml (unsound, no fix available)
-  # windows 0.29.0 — transitive via clap 2.x (unsound, no fix available)
-  # scc 2.4.0 — transitive via console (multiple unsound advisories, no fix)
-  # cxx 1.0.194 — transitive via roead's ryml dependency (unsound, no fix)
-  "RUSTSEC-2021-0139",
-  "RUSTSEC-2024-0320",
-  "RUSTSEC-2023-0055",
-  "RUSTSEC-2023-0086",
-  "RUSTSEC-2022-0008",
-  "RUSTSEC-2026-0202",
-  "RUSTSEC-2026-0205",
+  # Advisory IDs here must match actual advisories in the database.
+  # If an advisory is not encountered, cargo deny warns — remove it.
 ]
 
 [licenses]
@@ -26,8 +15,7 @@ allow = [
   "MIT",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
-  "BSD-3-Clause",
-  "ISC",
+  "BlueOak-1.0.0",
   "Unicode-3.0",
   "Zlib",
   "MPL-2.0",
@@ -41,4 +29,7 @@ wildcards = "warn"
 
 [sources]
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/NiceneNerd/msyt"]
+allow-git = [
+  "https://github.com/NiceneNerd/msyt",
+  "https://github.com/NiceneNerd/msbt-rs",
+]
