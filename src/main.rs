@@ -1059,7 +1059,7 @@ fn parse_lang_from_env() -> Lang {
 
 /// On Linux, re-launch inside a terminal if no TTY is attached.
 fn linux_relaunch_if_no_tty() -> Result<()> {
-    if cfg!(target_os = "linux") && !atty::is(atty::Stream::Stdin) {
+    if cfg!(target_os = "linux") && !is_terminal::is_terminal(&std::io::stdin()) {
         for term in [
             "xterm -e",
             "gnome-terminal --",

@@ -21,7 +21,7 @@ serde_yaml = "0.9.13"
 sys-locale = "0.3"
 zip = { version = "2.1", default-features = false, features = ["deflate"] }
 zstd = { version = "0.13.1", features = ["experimental"] }
-atty = "0.2"
+is-terminal = "0.4"
 minicbor = { version = "0.25.0", features = ["alloc", "full", "std"] }
 rayon = "1.6"
 

@@ -5,7 +5,21 @@ targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 unmaintained = "workspace"
 unsound = "workspace"
 yanked = "deny"
-ignore = []
+ignore = [
+  # ansi_term 0.12.1 — transitive via ryml -> clap 2.x (unmaintained, no fix available)
+  # yaml-rust 0.4.5 — transitive via ryml -> roead (unmaintained, no fix available)
+  # lexical / lexical-core — transitive via ryml (unsound, no fix available)
+  # windows 0.29.0 — transitive via clap 2.x (unsound, no fix available)
+  # scc 2.4.0 — transitive via console (multiple unsound advisories, no fix)
+  # cxx 1.0.194 — transitive via roead's ryml dependency (unsound, no fix)
+  "RUSTSEC-2021-0139",
+  "RUSTSEC-2024-0320",
+  "RUSTSEC-2023-0055",
+  "RUSTSEC-2023-0086",
+  "RUSTSEC-2022-0008",
+  "RUSTSEC-2026-0202",
+  "RUSTSEC-2026-0205",
+]
 
 [licenses]
 allow = [
