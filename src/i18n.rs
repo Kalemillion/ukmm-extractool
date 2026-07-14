@@ -152,7 +152,6 @@ fn build_en() -> HashMap<&'static str, &'static str> {
     m.insert("info.formats", "Supported formats: .byml / .sbyml / .sarc / .ssarc / .bshop / .aamp / .sbshop / .bdemo / .bfarc / .pack");
     m.insert("info.pipeline", "Pipeline: file → decompress → detect format → parse → serialize YAML / BYML");
     m.insert("info.rebuild", "Rebuild: YAML / .sbyml → CBOR wire format → zstd compress → inject into ZIP");
-    m.insert("info.more", "See AGENTS.md for full documentation.");
 
     // Errors
     m.insert("err.generic", "{msg}");
@@ -264,7 +263,6 @@ fn build_fr() -> HashMap<&'static str, &'static str> {
     m.insert("info.formats", "Formats supportés : .byml / .sbyml / .sarc / .ssarc / .bshop / .aamp / .sbshop / .bdemo / .bfarc / .pack");
     m.insert("info.pipeline", "Pipeline : fichier → décompresser → détecter le format → analyser → sérialiser YAML / BYML");
     m.insert("info.rebuild", "Reconstruction : YAML / .sbyml → format CBOR → compression zstd → injection dans le ZIP");
-    m.insert("info.more", "Voir AGENTS.md pour la documentation complète.");
 
     m.insert("err.generic", "{msg}");
     m.insert("err.invalid_selection", "Sélection invalide.");

@@ -19,9 +19,11 @@
 //!
 //! With no arguments, launches the interactive TUI.
 
+mod box_draw;
 mod cli;
 mod i18n;
 
+use crate::box_draw::print_box;
 use crate::i18n::Lang;
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -1232,31 +1234,32 @@ fn run_interactive(lang: &Lang) -> Result<()> {
 /// Print the app banner.
 fn print_banner(lang: &Lang) {
     let ver = lang.t("app.version");
-    println!("╔═════════════════════════════════════════╗");
-    println!("║             {}             ║", lang.t("app.title"));
-    println!("║  {}  ║", lang.t("app.subtitle"));
-    println!("║                 v{}                  ║", ver);
-    println!("╚═════════════════════════════════════════╝");
+    let lines = &[
+        lang.t("app.title"),
+        lang.t("app.subtitle"),
+        &format!("v{ver}"),
+    ];
+    print_box(lines);
 }
 
 // ── Info screen ─────────────────────────────────────────────────────────────
 
 fn show_info(lang: &Lang) -> Result<()> {
     println!();
-    println!("╔════════════════════════════════════════════════╗");
-    println!("║  {}  ║", lang.t("info.title"));
-    println!("╠════════════════════════════════════════════════╣");
-    println!("║                                                ║");
-    println!("║  {}  ║", lang.t("info.desc"));
-    println!("║                                                ║");
-    println!("║  {}  ║", lang.t("info.formats"));
-    println!("║                                                ║");
-    println!("║  {}  ║", lang.t("info.pipeline"));
-    println!("║                                                ║");
-    println!("║  {}  ║", lang.t("info.rebuild"));
-    println!("║                                                ║");
-    println!("║  {}  ║", lang.t("info.more"));
-    println!("╚════════════════════════════════════════════════╝");
+    let lines = &[
+        lang.t("info.title"),
+        "",
+        lang.t("info.desc"),
+        "",
+        lang.t("info.formats"),
+        "",
+        lang.t("info.pipeline"),
+        "",
+        lang.t("info.rebuild"),
+        "",
+        lang.t("info.more"),
+    ];
+    print_box(lines);
     println!();
     prompt(lang.t("common.press_enter"));
     Ok(())

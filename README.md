@@ -26,25 +26,62 @@ Portable — no installation needed, just run the binary.
 
 ## Usage
 
+### Interactive mode (no arguments)
+
 ```bash
-ukmm-extractool.exe
+ukmm-extractool
 ```
 
-### UKMM mods — Wii U / Switch
+Launches an interactive menu:
+```
+  ❯ Extract a mod         Extraire un mod
+    Rebuild a mod         Reconstruire un mod
+    Restore a mod         Restaurer un mod
+    List available mods   Lister les mods disponibles
+    Information           Informations
+    Quit                  Quitter
+```
 
-1. Pick your platform — **Wii U** (1) or **Switch** (2)
-2. The tool scans your UKMM mods directory (`%LOCALAPPDATA%/ukmm/{wiiu,nx}/mods/`)
-3. Pick a mod from the list
-4. Converts all mod files:
+Bilingual (EN/FR) — auto-detected from system locale. Override with `UKMM_LANG=fr` or `--lang fr`.
+
+### CLI subcommands
+
+```bash
+# Extract a UKMM mod to the workspace
+ukmm-extractool extract "C:\Users\...\ukmm\wiiu\mods\MyMod.zip"
+
+# Rebuild a mod from edited files (from workspace directory)
+cd mods/wiiu/MyMod
+ukmm-extractool rebuild
+
+# Restore original from backup
+ukmm-extractool restore mods/wiiu/MyMod
+
+# List all UKMM mods
+ukmm-extractool list
+```
+
+A bare file path also works (legacy auto-detect):
+```bash
+ukmm-extractool ActorInfo.product.byml
+```
+
+### Workflow
+
+1. Run without arguments → interactive menu
+2. Choose **Extract a mod** → pick a mod from the list (Wii U 🩵 / Switch 🔴)
+3. All resource files are converted:
    - `Message/*.sarc` → structured `.yaml`
-   - `*.byml` (roead format) → native `.sbyml` (edit with TotkBits)
-   - `*.byml` (other) → editable `.yaml`
-5. Original mod ZIP is backed up as `<mod_name>_backup.zip`
+   - `ActorInfo.product.byml` → native `.sbyml` (Actors/Hashes arrays)
+   - Mergeable `*.byml` (roead format) → native `.sbyml`
+   - Other `*.byml` → editable `.yaml`
+   - `*.bactorpack` / `*.bfarc` → `.yaml` (SarcMap format)
+4. Original mod ZIP is backed up as `<mod_name>_backup.zip`
 
-**Rebuilding:** Run again, pick the same mod, choose **[1] Rebuild**.
-Edited `.sbyml` and `.yaml` files are converted back and injected into the ZIP.
+**Rebuilding:** Run again, pick the same mod, choose **Rebuild**.
+Edited `.sbyml` and `.yaml` files are converted back to CBOR and injected into the ZIP.
 
-**Restore:** Pick **[3] Restore original (from backup)** to undo all edits.
+**Restore:** Pick **Restore** to undo all edits from the backup.
 
 ---
 
@@ -84,7 +121,7 @@ Binary at `target/release/ukmm-extractool.exe`.
 ### Development
 
 ```bash
-cargo test                     # 29+ unit tests
+cargo test                     # 35+ unit tests
 cargo clippy -- -D warnings    # Lint (must pass CI)
 cargo fmt -- --check           # Formatting (rustfmt defaults)
 cargo deny check               # Supply-chain audit
